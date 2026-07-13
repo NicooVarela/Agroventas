@@ -1,0 +1,19 @@
+{
+  "name": "Agroventas Challenge",
+  "short_name": "Agroventas",
+  "description": "Juego interactivo Agroventas para stand.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#f3fbf6",
+  "theme_color": "#f3fbf6",
+  "icons": [
+    {
+      "src": "/app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

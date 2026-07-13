@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#f3fbf6"/>
+  <circle cx="256" cy="256" r="174" fill="#fff" stroke="#dff3e9" stroke-width="20"/>
+  <path fill="none" stroke="#0fa461" stroke-linecap="round" stroke-width="42" d="M256 105a151 151 0 1 1-130 228"/>
+  <path fill="none" stroke="#42bee0" stroke-linecap="round" stroke-width="42" d="M126 333a151 151 0 0 1 58-194"/>
+  <text x="256" y="283" fill="#103f2d" font-family="Arial, Helvetica, sans-serif" font-size="118" font-weight="900" text-anchor="middle">AG</text>
+</svg>
