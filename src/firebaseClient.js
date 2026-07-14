@@ -40,7 +40,7 @@ const RESULTS_KEY = 'agroventas.game_results'
 const LIVE_GAMES_KEY = 'agroventas.live_games'
 const SESSIONS_KEY = 'agroventas.sessions'
 const ADMIN_KEY = 'agroventas.admin'
-const COMPONENT_TIMEOUT_MS = 5_000
+const COMPONENT_TIMEOUT_MS = 12_000
 const COMPONENT_CHECK_INTERVAL_MS = 2_000
 const REQUIRED_COMPONENTS = [
   'controller',
@@ -249,21 +249,21 @@ function getAdminHealth(config = ADMIN_DEFAULTS) {
     }
   }
 
-  if (admin.game_control.can_start !== true) {
-    return {
-      blocked: true,
-      code: ERROR_CODES.ADMIN_GLOBAL_START_BLOCKED,
-      message: 'El bloqueo operativo global está activo desde Admin.',
-      blockedComponents,
-    }
-  }
-
   if (admin.settings.require_component_check !== false && blockedComponents.length > 0) {
     return {
       blocked: true,
       code: ERROR_CODES.ADMIN_COMPONENTS_BLOCKED,
       message: `Componentes con error: ${blockedComponents.join(', ')}.`,
       blockedComponents,
+    }
+  }
+
+  if (admin.game_control.can_start !== true) {
+    return {
+      blocked: true,
+      code: ERROR_CODES.ADMIN_GLOBAL_START_BLOCKED,
+      message: 'El bloqueo operativo global está activo desde Admin.',
+      blockedComponents: [],
     }
   }
 
@@ -397,6 +397,8 @@ export function startComponentStatusMonitor(getCurrentScreen) {
 
   if (isFirebaseConfigured) {
     let latestComponentStatus = {}
+    let healthWriteInProgress = false
+    let receivedFirstStatus = false
 
     const screenStatusRef = ref(realtimeDb, 'admin/component_status/screen')
     onDisconnect(screenStatusRef).update({
@@ -424,31 +426,53 @@ export function startComponentStatusMonitor(getCurrentScreen) {
         'admin/components': nextComponents,
         'admin/game_control/can_start': allOk,
         'admin/game_control/status': allOk ? 'ready' : 'component_error',
+        'admin/errors/last_error': allOk
+          ? null
+          : {
+              type: 'component_error',
+              detected_at: timestamp,
+              failed_components: failedComponents,
+            },
       }
 
       if (!allOk) {
         updates['admin/game_control/motors_enabled'] = false
-        updates['admin/errors/last_error'] = {
-          type: 'component_error',
-          detected_at: timestamp,
-          failed_components: failedComponents,
-        }
       }
 
       await update(ref(realtimeDb), updates)
+    }
+
+    const safelyWriteHealth = async () => {
+      if (healthWriteInProgress) return
+      healthWriteInProgress = true
+
+      try {
+        await writeHealth()
+      } finally {
+        healthWriteInProgress = false
+      }
     }
 
     const unsubscribeStatus = onValue(
       ref(realtimeDb, 'admin/component_status'),
       (snapshot) => {
         latestComponentStatus = snapshot.val() ?? {}
-        writeHealth().catch((error) => console.warn('Could not update component health.', error))
+        if (!receivedFirstStatus) {
+          receivedFirstStatus = true
+          safelyWriteHealth().catch((error) =>
+            console.warn('Could not update component health.', error)
+          )
+        }
       },
-      (error) => console.warn('Could not read component_status.', error),
+      (error) => {
+        console.warn('Could not read component_status.', error)
+      },
     )
 
     const interval = window.setInterval(() => {
-      writeHealth().catch((error) => console.warn('Could not update component heartbeat.', error))
+      safelyWriteHealth().catch((error) =>
+        console.warn('Could not update component health.', error)
+      )
     }, COMPONENT_CHECK_INTERVAL_MS)
 
     return () => {
@@ -477,13 +501,15 @@ export function startComponentStatusMonitor(getCurrentScreen) {
     const allOk = getRequiredComponentsOk(admin.components)
     admin.game_control.can_start = allOk
     admin.game_control.status = allOk ? 'ready' : 'component_error'
+    admin.errors.last_error = allOk
+      ? null
+      : {
+          type: 'component_error',
+          detected_at: timestamp,
+          failed_components: getComponentError(admin.components),
+        }
     if (!allOk) {
       admin.game_control.motors_enabled = false
-      admin.errors.last_error = {
-        type: 'component_error',
-        detected_at: timestamp,
-        failed_components: getComponentError(admin.components),
-      }
     }
     writeLocal(ADMIN_KEY, admin)
   }
