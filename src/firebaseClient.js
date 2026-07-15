@@ -1075,11 +1075,34 @@ export function startGameHeartbeat(gameId) {
 export function listenForVictory(gameId, callback) {
   if (isFirebaseConfigured) {
     const gameRef = ref(realtimeDb, `sessions/${getActiveSessionId()}/live_games/${gameId}`)
-    const unsubscribe = onValue(gameRef, (snapshot) => {
+    const finishSignalRef = ref(realtimeDb, 'admin/game_control/finish_signal')
+    let finishSignalInitialized = false
+    let lastFinishSignalToken = null
+
+    const unsubscribeGame = onValue(gameRef, (snapshot) => {
       const value = snapshot.val()
       if (value?.status === 'won') callback(value)
     })
-    return unsubscribe
+    const unsubscribeFinishSignal = onValue(finishSignalRef, (snapshot) => {
+      const value = snapshot.val()
+      const token = getStartSignalToken(value)
+
+      // Ignore the last signal already stored when a new game subscribes.
+      if (!finishSignalInitialized) {
+        finishSignalInitialized = true
+        lastFinishSignalToken = token
+        return
+      }
+
+      if (!value?.active || !token || token === lastFinishSignalToken) return
+      lastFinishSignalToken = token
+      callback({ ...value, status: 'won', hardware_signal: true })
+    })
+
+    return () => {
+      unsubscribeGame()
+      unsubscribeFinishSignal()
+    }
   }
 
   const interval = window.setInterval(() => {

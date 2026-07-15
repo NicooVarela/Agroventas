@@ -64,13 +64,13 @@ Crear la sesion inicial en Realtime Database:
 }
 ```
 
-La senal del dispositivo fisico se escucha en un canal tecnico dentro de la sesion activa:
+La senal tecnica de una partida puede quedar registrada en el canal de la sesion activa:
 
 ```txt
 sessions/{session_id}/live_games/{game_id}
 ```
 
-Para marcar victoria, el dispositivo debe escribir:
+El formato de victoria directa para una integracion que conozca el `game_id` es:
 
 ```json
 {
@@ -79,7 +79,15 @@ Para marcar victoria, el dispositivo debe escribir:
 }
 ```
 
-La tablet escucha ese cambio, corta el timer y guarda el resultado completado en `game_results`.
+La victoria detectada por el sensor superior llega desde la ESP32 por:
+
+```txt
+admin/game_control/finish_signal
+```
+
+La web escucha ese canal durante la partida y lo transforma en un resultado ganador para la partida activa. La senal anterior se ignora al comenzar una partida nueva.
+
+La ESP32 fisica no necesita conocer el `game_id`: envia `admin/game_control/finish_signal`. La tablet escucha ambos formatos, corta el timer y guarda el resultado completado en `game_results`.
 
 Cada partida viva registra presencia de tablet:
 
@@ -103,6 +111,8 @@ Mientras la partida esta activa, la app actualiza `heartbeat_at` cada 5 segundos
 ## Admin
 
 La app lee `admin` antes de iniciar cada partida. Si algun control global o componente esta en `false`, no crea la partida.
+
+La ESP32 publica solamente datos crudos en `admin/component_status`. La web es la unica responsable de calcular `admin/components`, `admin/game_control/can_start` y `admin/errors/last_error`.
 
 Estructura:
 
