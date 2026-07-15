@@ -25,6 +25,7 @@ const firebaseConfig = {
 
 const DEFAULT_SESSION_ID = import.meta.env.VITE_FIREBASE_SESSION_ID || 'session_001'
 let activeSessionId = DEFAULT_SESSION_ID
+let realtimeDatabaseConnected = false
 
 export const isFirebaseConfigured = Boolean(
   firebaseConfig.apiKey &&
@@ -48,13 +49,50 @@ const firebaseAuthReady = firebaseAuth
         }))
   : Promise.resolve(null)
 
+let realtimeConnectionMonitorCleanup = null
+let realtimeConnectionMonitorPromise = null
+let processedFinishSignalRequestIds = []
+
+async function ensureRealtimeConnectionMonitor() {
+  if (!isFirebaseConfigured || !realtimeDb) return
+  if (realtimeConnectionMonitorPromise) return realtimeConnectionMonitorPromise
+
+  realtimeConnectionMonitorPromise = (async () => {
+    await firebaseAuthReady
+    if (!isFirebaseConfigured || !realtimeDb || realtimeConnectionMonitorCleanup) return
+
+    const connectedRef = ref(realtimeDb, '.info/connected')
+    realtimeConnectionMonitorCleanup = onValue(
+      connectedRef,
+      (snapshot) => {
+        realtimeDatabaseConnected = snapshot.val() === true
+      },
+      (error) => {
+        realtimeDatabaseConnected = false
+        console.warn('Could not monitor realtime connection.', error)
+      },
+    )
+  })()
+
+  return realtimeConnectionMonitorPromise
+}
+
+function releaseRealtimeConnectionMonitor() {
+  if (realtimeConnectionMonitorCleanup) {
+    realtimeConnectionMonitorCleanup()
+    realtimeConnectionMonitorCleanup = null
+  }
+  realtimeConnectionMonitorPromise = null
+}
+
 const USERS_KEY = 'agroventas.users'
 const RESULTS_KEY = 'agroventas.game_results'
 const LIVE_GAMES_KEY = 'agroventas.live_games'
 const SESSIONS_KEY = 'agroventas.sessions'
 const ADMIN_KEY = 'agroventas.admin'
-const COMPONENT_TIMEOUT_MS = 12_000
-const COMPONENT_CHECK_INTERVAL_MS = 2_000
+const COMPONENT_TIMEOUT_MS = 15_000
+const RESETTING_COMPONENT_TIMEOUT_MS = 25_000
+const COMPONENT_CHECK_INTERVAL_MS = 4_000
 const REQUIRED_COMPONENTS = [
   'controller',
   'screen',
@@ -98,6 +136,8 @@ const ADMIN_DEFAULTS = {
   },
   game_control: {
     can_start: true,
+    components_ok: true,
+    manual_block: false,
     motors_enabled: false,
     status: 'ready',
     last_check_at: null,
@@ -109,6 +149,14 @@ const ADMIN_DEFAULTS = {
       last_handled_at: null,
       last_ignored_at: null,
       last_ignored_reason: null,
+    },
+    finish_signal: {
+      active: false,
+      request_id: null,
+      detected_at: null,
+      acknowledged_at: null,
+      acknowledged_request_id: null,
+      handled_by: null,
     },
   },
   interrupted_game: {
@@ -191,13 +239,25 @@ function toSessionList(sessionsById = {}) {
 }
 
 function mergeAdminConfig(config = {}) {
+  const gameControlConfig = config.game_control ?? {}
   const admin = {
     ...ADMIN_DEFAULTS,
     ...config,
     settings: { ...ADMIN_DEFAULTS.settings, ...(config.settings ?? {}) },
     components: { ...ADMIN_DEFAULTS.components, ...(config.components ?? {}) },
     component_status: { ...ADMIN_DEFAULTS.component_status, ...(config.component_status ?? {}) },
-    game_control: { ...ADMIN_DEFAULTS.game_control, ...(config.game_control ?? {}) },
+    game_control: {
+      ...ADMIN_DEFAULTS.game_control,
+      ...gameControlConfig,
+      start_signal: {
+        ...ADMIN_DEFAULTS.game_control.start_signal,
+        ...(gameControlConfig.start_signal ?? {}),
+      },
+      finish_signal: {
+        ...ADMIN_DEFAULTS.game_control.finish_signal,
+        ...(gameControlConfig.finish_signal ?? {}),
+      },
+    },
     interrupted_game: { ...ADMIN_DEFAULTS.interrupted_game, ...(config.interrupted_game ?? {}) },
     errors: { ...ADMIN_DEFAULTS.errors, ...(config.errors ?? {}) },
   }
@@ -211,20 +271,55 @@ function getBlockedComponents(components) {
     .map(([key]) => key)
 }
 
-function componentIsAlive(status, referenceTime = now()) {
-  return status?.online === true && Number.isFinite(status?.last_seen) && referenceTime - status.last_seen < COMPONENT_TIMEOUT_MS
+function componentIsAlive(status, referenceTime = now(), timeoutMs = COMPONENT_TIMEOUT_MS) {
+  return (
+    status?.online === true &&
+    Number.isFinite(status?.last_seen) &&
+    referenceTime - status.last_seen < timeoutMs
+  )
+}
+
+function componentReportsError(status) {
+  const state = String(status?.current_state ?? '').trim().toLowerCase()
+  return (
+    status?.reset_timed_out === true ||
+    ['error', 'fault', 'failed', 'offline'].includes(state)
+  )
+}
+
+function componentIsHealthy(status, referenceTime, timeoutMs) {
+  return componentIsAlive(status, referenceTime, timeoutMs) && !componentReportsError(status)
 }
 
 function getComponentHealthFromStatus(componentStatus = {}) {
   const referenceTime = now()
+  const controllerStatus = componentStatus.esp32 ?? {}
+  const controllerState = String(controllerStatus.current_state ?? '').toLowerCase()
+  const controllerBusy =
+    controllerStatus.resetting === true ||
+    [
+      'resetting',
+      'dispensing',
+      'dispensing_close',
+      'returning_home',
+      'waiting_for_home',
+      'busy',
+    ].includes(controllerState)
+  const effectiveTimeoutMs = controllerBusy
+    ? RESETTING_COMPONENT_TIMEOUT_MS
+    : COMPONENT_TIMEOUT_MS
   const components = {
     power: true,
-    realtime_database: isFirebaseConfigured,
-    screen: componentIsAlive(componentStatus.screen, referenceTime),
+    realtime_database: realtimeDatabaseConnected,
+    screen: componentIsHealthy(componentStatus.screen, referenceTime, effectiveTimeoutMs),
   }
 
   Object.entries(COMPONENT_STATUS_TO_COMPONENT).forEach(([statusKey, componentKey]) => {
-    components[componentKey] = componentIsAlive(componentStatus[statusKey], referenceTime)
+    components[componentKey] = componentIsHealthy(
+      componentStatus[statusKey],
+      referenceTime,
+      effectiveTimeoutMs,
+    )
   })
 
   REQUIRED_COMPONENTS.forEach((component) => {
@@ -252,6 +347,18 @@ function createAppError(code, message) {
 function getAdminHealth(config = ADMIN_DEFAULTS) {
   const admin = mergeAdminConfig(config)
   const blockedComponents = getBlockedComponents(admin.components)
+  const firebaseAvailable = !isFirebaseConfigured || realtimeDatabaseConnected
+  const componentsOk = getRequiredComponentsOk(admin.components)
+  const manualBlocked = admin.game_control.manual_block === true
+
+  if (!firebaseAvailable) {
+    return {
+      blocked: true,
+      code: ERROR_CODES.ADMIN_UNAVAILABLE,
+      message: 'No se puede verificar el estado de Admin.',
+      blockedComponents,
+    }
+  }
 
   if (admin.settings.allow_new_games !== true) {
     return {
@@ -262,7 +369,7 @@ function getAdminHealth(config = ADMIN_DEFAULTS) {
     }
   }
 
-  if (admin.settings.require_component_check !== false && blockedComponents.length > 0) {
+  if (admin.settings.require_component_check !== false && !componentsOk) {
     return {
       blocked: true,
       code: ERROR_CODES.ADMIN_COMPONENTS_BLOCKED,
@@ -271,7 +378,7 @@ function getAdminHealth(config = ADMIN_DEFAULTS) {
     }
   }
 
-  if (admin.game_control.can_start !== true) {
+  if (manualBlocked) {
     return {
       blocked: true,
       code: ERROR_CODES.ADMIN_GLOBAL_START_BLOCKED,
@@ -380,22 +487,53 @@ export function formatTime(ms) {
 
 export function listenAdminHealth(callback) {
   if (isFirebaseConfigured) {
-    const adminRef = ref(realtimeDb, 'admin')
-    const unsubscribe = onValue(
-      adminRef,
-      (snapshot) => {
-        callback(getAdminHealth(snapshot.exists() ? snapshot.val() : ADMIN_DEFAULTS))
-      },
-      (error) => {
-        callback({
-          blocked: true,
-          code: ERROR_CODES.ADMIN_UNAVAILABLE,
-          message: `No se puede verificar el estado de Admin. Firebase: ${error.code ?? 'desconocido'}.`,
-          blockedComponents: [],
-        })
-      },
-    )
-    return unsubscribe
+    let unsubscribe = () => {}
+    let cancelled = false
+
+    const initialize = async () => {
+      await firebaseAuthReady
+      if (cancelled) return
+
+      const adminRef = ref(realtimeDb, 'admin')
+      unsubscribe = onValue(
+        adminRef,
+        (snapshot) => {
+          if (!snapshot.exists()) {
+            callback({
+              blocked: true,
+              code: ERROR_CODES.ADMIN_UNAVAILABLE,
+              message: 'No se puede verificar el estado de Admin.',
+              blockedComponents: [],
+            })
+            return
+          }
+
+          callback(getAdminHealth(snapshot.val()))
+        },
+        (error) => {
+          callback({
+            blocked: true,
+            code: ERROR_CODES.ADMIN_UNAVAILABLE,
+            message: `No se puede verificar el estado de Admin. Firebase: ${error.code ?? 'desconocido'}.`,
+            blockedComponents: [],
+          })
+        },
+      )
+    }
+
+    initialize().catch((error) => {
+      callback({
+        blocked: true,
+        code: ERROR_CODES.ADMIN_UNAVAILABLE,
+        message: `No se puede verificar el estado de Admin. Firebase: ${error.code ?? 'desconocido'}.`,
+        blockedComponents: [],
+      })
+    })
+
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
   }
 
   callback(getAdminHealth(readLocal(ADMIN_KEY, ADMIN_DEFAULTS)))
@@ -410,92 +548,162 @@ export function startComponentStatusMonitor(getCurrentScreen) {
 
   if (isFirebaseConfigured) {
     let latestComponentStatus = {}
+    let latestAdminConfig = mergeAdminConfig(ADMIN_DEFAULTS)
     let healthWriteInProgress = false
     let receivedFirstStatus = false
+    let receivedFirstAdmin = false
+    let initialHealthWriteTriggered = false
+    let cleanup = () => {}
+    let cancelled = false
 
-    const screenStatusRef = ref(realtimeDb, 'admin/component_status/screen')
-    onDisconnect(screenStatusRef).update({
-      online: false,
-      disconnected_at: serverTimestamp(),
-      disconnected_at_client: now(),
-    }).catch((error) => console.warn('Could not register screen onDisconnect.', error))
+    const initialize = async () => {
+      await firebaseAuthReady
+      if (cancelled) return
+      await ensureRealtimeConnectionMonitor()
+      if (cancelled) return
 
-    const writeHealth = async () => {
-      const timestamp = now()
-      const nextComponentStatus = {
-        ...latestComponentStatus,
-        screen: {
-          online: true,
-          last_seen: timestamp,
+      const screenStatusRef = ref(realtimeDb, 'admin/component_status/screen')
+      cleanup = () => {
+        window.clearInterval(interval)
+        unsubscribeStatus?.()
+        unsubscribeAdmin?.()
+        update(screenStatusRef, {
+          online: false,
+          last_seen: now(),
           current_screen: getScreen(),
-        },
+        }).catch((error) => console.warn('Could not mark screen offline.', error))
       }
-      const nextComponents = getComponentHealthFromStatus(nextComponentStatus)
-      const allOk = getRequiredComponentsOk(nextComponents)
-      const failedComponents = getComponentError(nextComponents)
 
-      const updates = {
-        'admin/component_status/screen': nextComponentStatus.screen,
-        'admin/components': nextComponents,
-        'admin/game_control/can_start': allOk,
-        'admin/game_control/status': allOk ? 'ready' : 'component_error',
-        'admin/errors/last_error': allOk
-          ? null
-          : {
+      onDisconnect(screenStatusRef).update({
+        online: false,
+        disconnected_at: serverTimestamp(),
+        disconnected_at_client: now(),
+      }).catch((error) => console.warn('Could not register screen onDisconnect.', error))
+
+      const writeHealth = async () => {
+        const timestamp = now()
+        const nextComponentStatus = {
+          ...latestComponentStatus,
+          screen: {
+            online: true,
+            last_seen: timestamp,
+            current_screen: getScreen(),
+          },
+        }
+        const nextComponents = getComponentHealthFromStatus(nextComponentStatus)
+        const allOk = getRequiredComponentsOk(nextComponents)
+        const failedComponents = getComponentError(nextComponents)
+        const currentAdmin = mergeAdminConfig(latestAdminConfig)
+        const currentLastError = currentAdmin.errors?.last_error ?? null
+        const manualBlocked = currentAdmin.game_control?.manual_block === true
+        const componentsOk = allOk
+        const canStart = currentAdmin.settings.allow_new_games === true && componentsOk && !manualBlocked
+        const nextStatus = manualBlocked ? 'blocked' : (allOk ? 'ready' : 'component_error')
+
+        let nextLastError = currentLastError
+        if (!allOk) {
+          const currentFailedComponents = currentLastError?.failed_components ?? []
+          const sameFailedComponents =
+            currentLastError?.type === 'component_error' &&
+            currentFailedComponents.length === failedComponents.length &&
+            currentFailedComponents.every((component, index) => component === failedComponents[index])
+
+          if (!sameFailedComponents) {
+            nextLastError = {
               type: 'component_error',
               detected_at: timestamp,
               failed_components: failedComponents,
-            },
-      }
-
-      if (!allOk) {
-        updates['admin/game_control/motors_enabled'] = false
-      }
-
-      await update(ref(realtimeDb), updates)
-    }
-
-    const safelyWriteHealth = async () => {
-      if (healthWriteInProgress) return
-      healthWriteInProgress = true
-
-      try {
-        await writeHealth()
-      } finally {
-        healthWriteInProgress = false
-      }
-    }
-
-    const unsubscribeStatus = onValue(
-      ref(realtimeDb, 'admin/component_status'),
-      (snapshot) => {
-        latestComponentStatus = snapshot.val() ?? {}
-        if (!receivedFirstStatus) {
-          receivedFirstStatus = true
-          safelyWriteHealth().catch((error) =>
-            console.warn('Could not update component health.', error)
-          )
+            }
+          }
+        } else if (nextLastError?.type === 'component_error') {
+          nextLastError = null
         }
-      },
-      (error) => {
-        console.warn('Could not read component_status.', error)
-      },
-    )
 
-    const interval = window.setInterval(() => {
-      safelyWriteHealth().catch((error) =>
-        console.warn('Could not update component health.', error)
+        const updates = {
+          'admin/component_status/screen': nextComponentStatus.screen,
+        }
+        const componentsChanged = Object.entries(nextComponents).some(
+          ([component, value]) => currentAdmin.components?.[component] !== value,
+        )
+
+        if (componentsChanged) updates['admin/components'] = nextComponents
+        if (currentAdmin.game_control?.components_ok !== componentsOk) {
+          updates['admin/game_control/components_ok'] = componentsOk
+        }
+        if (currentAdmin.game_control?.can_start !== canStart) {
+          updates['admin/game_control/can_start'] = canStart
+        }
+        if (currentAdmin.game_control?.status !== nextStatus) {
+          updates['admin/game_control/status'] = nextStatus
+        }
+        if (JSON.stringify(currentLastError) !== JSON.stringify(nextLastError)) {
+          updates['admin/errors/last_error'] = nextLastError
+        }
+        if (!allOk && currentAdmin.game_control?.motors_enabled !== false) {
+          updates['admin/game_control/motors_enabled'] = false
+        }
+
+        await update(ref(realtimeDb), updates)
+      }
+
+      const safelyWriteHealth = async () => {
+        if (healthWriteInProgress) return
+        healthWriteInProgress = true
+
+        try {
+          await writeHealth()
+        } finally {
+          healthWriteInProgress = false
+        }
+      }
+
+      const tryInitialHealthWrite = () => {
+        if (!receivedFirstStatus || !receivedFirstAdmin || initialHealthWriteTriggered) return
+        initialHealthWriteTriggered = true
+        safelyWriteHealth().catch((error) =>
+          console.warn('Could not update component health.', error)
+        )
+      }
+
+      const unsubscribeStatus = onValue(
+        ref(realtimeDb, 'admin/component_status'),
+        (snapshot) => {
+          latestComponentStatus = snapshot.val() ?? {}
+          receivedFirstStatus = true
+          tryInitialHealthWrite()
+        },
+        (error) => {
+          console.warn('Could not read component_status.', error)
+        },
       )
-    }, COMPONENT_CHECK_INTERVAL_MS)
+
+      const unsubscribeAdmin = onValue(
+        ref(realtimeDb, 'admin'),
+        (snapshot) => {
+          latestAdminConfig = snapshot.exists()
+            ? mergeAdminConfig(snapshot.val())
+            : mergeAdminConfig(ADMIN_DEFAULTS)
+          receivedFirstAdmin = true
+          tryInitialHealthWrite()
+        },
+        (error) => {
+          console.warn('Could not read admin configuration.', error)
+        },
+      )
+
+      const interval = window.setInterval(() => {
+        safelyWriteHealth().catch((error) =>
+          console.warn('Could not update component health.', error)
+        )
+      }, COMPONENT_CHECK_INTERVAL_MS)
+    }
+
+    initialize().catch((error) => console.warn('Could not initialize component status monitor.', error))
 
     return () => {
-      window.clearInterval(interval)
-      unsubscribeStatus()
-      update(screenStatusRef, {
-        online: false,
-        last_seen: now(),
-        current_screen: getScreen(),
-      }).catch((error) => console.warn('Could not mark screen offline.', error))
+      cancelled = true
+      cleanup()
+      releaseRealtimeConnectionMonitor()
     }
   }
 
@@ -512,15 +720,24 @@ export function startComponentStatusMonitor(getCurrentScreen) {
     }
     admin.components = getComponentHealthFromStatus(admin.component_status)
     const allOk = getRequiredComponentsOk(admin.components)
-    admin.game_control.can_start = allOk
-    admin.game_control.status = allOk ? 'ready' : 'component_error'
-    admin.errors.last_error = allOk
-      ? null
-      : {
-          type: 'component_error',
-          detected_at: timestamp,
-          failed_components: getComponentError(admin.components),
-        }
+    const currentLastError = admin.errors?.last_error
+    const manualBlocked = admin.game_control?.manual_block === true
+    const componentsOk = allOk
+    const canStart = admin.settings.allow_new_games === true && componentsOk && !manualBlocked
+    admin.game_control.components_ok = componentsOk
+    admin.game_control.can_start = canStart
+    admin.game_control.status = manualBlocked ? 'blocked' : (allOk ? 'ready' : 'component_error')
+    let nextLastError = currentLastError ?? null
+    if (!allOk) {
+      nextLastError = {
+        type: 'component_error',
+        detected_at: timestamp,
+        failed_components: getComponentError(admin.components),
+      }
+    } else if (nextLastError?.type === 'component_error') {
+      nextLastError = null
+    }
+    admin.errors.last_error = nextLastError
     if (!allOk) {
       admin.game_control.motors_enabled = false
     }
@@ -553,13 +770,47 @@ async function updateStartSignalStatus(payload) {
 }
 
 export function listenForPhysicalStart(callback) {
-  if (isFirebaseConfigured) {
-    const startRef = ref(realtimeDb, 'admin/game_control/start_signal')
+  let cleanup = () => {}
+  let cancelled = false
+
+  const initialize = async () => {
+    await firebaseAuthReady
+    if (cancelled) return
+
+    if (isFirebaseConfigured) {
+      const startRef = ref(realtimeDb, 'admin/game_control/start_signal')
+      let lastToken = null
+      let initialized = false
+
+      cleanup = onValue(startRef, async (snapshot) => {
+        const value = snapshot.val()
+        const token = getStartSignalToken(value)
+
+        if (!initialized) {
+          initialized = true
+          lastToken = token
+          return
+        }
+
+        if (!token) return
+        if (token === lastToken) return
+        lastToken = token
+
+        const handled = await callback(value)
+        await updateStartSignalStatus({
+          active: false,
+          [handled ? 'last_handled_at' : 'last_ignored_at']: now(),
+          last_ignored_reason: handled ? null : 'tablet_not_on_idle_screen',
+        })
+      })
+      return
+    }
+
     let lastToken = null
     let initialized = false
-
-    return onValue(startRef, async (snapshot) => {
-      const value = snapshot.val()
+    const interval = window.setInterval(async () => {
+      const admin = mergeAdminConfig(readLocal(ADMIN_KEY, ADMIN_DEFAULTS))
+      const value = admin.game_control.start_signal
       const token = getStartSignalToken(value)
 
       if (!initialized) {
@@ -571,41 +822,23 @@ export function listenForPhysicalStart(callback) {
       if (!token) return
       if (token === lastToken) return
       lastToken = token
-
       const handled = await callback(value)
       await updateStartSignalStatus({
         active: false,
         [handled ? 'last_handled_at' : 'last_ignored_at']: now(),
         last_ignored_reason: handled ? null : 'tablet_not_on_idle_screen',
       })
-    })
+    }, 250)
+
+    cleanup = () => window.clearInterval(interval)
   }
 
-  let lastToken = null
-  let initialized = false
-  const interval = window.setInterval(async () => {
-    const admin = mergeAdminConfig(readLocal(ADMIN_KEY, ADMIN_DEFAULTS))
-    const value = admin.game_control.start_signal
-    const token = getStartSignalToken(value)
+  initialize().catch((error) => console.warn('Could not initialize physical start listener.', error))
 
-    if (!initialized) {
-      initialized = true
-      lastToken = token
-      return
-    }
-
-    if (!token) return
-    if (token === lastToken) return
-    lastToken = token
-    const handled = await callback(value)
-    await updateStartSignalStatus({
-      active: false,
-      [handled ? 'last_handled_at' : 'last_ignored_at']: now(),
-      last_ignored_reason: handled ? null : 'tablet_not_on_idle_screen',
-    })
-  }, 250)
-
-  return () => window.clearInterval(interval)
+  return () => {
+    cancelled = true
+    cleanup()
+  }
 }
 
 export async function signalPhysicalStart(source = 'staff_panel') {
@@ -630,6 +863,71 @@ export async function setMotorsEnabled(enabled) {
   })
 }
 
+function hardwareCycleIsReady(componentStatus = {}, notBefore = 0) {
+  const referenceTime = now()
+  const controller = componentStatus.esp32 ?? {}
+  const motors = componentStatus.motors ?? {}
+  const dispenser = componentStatus.dispenser ?? {}
+  const controllerState = String(controller.current_state ?? '').toLowerCase()
+  const motorsState = String(motors.current_state ?? '').toLowerCase()
+  const dispenserState = String(dispenser.current_state ?? '').toLowerCase()
+  const freshestRequiredHeartbeat = Math.min(
+    Number(controller.last_seen) || 0,
+    Number(motors.last_seen) || 0,
+    Number(dispenser.last_seen) || 0,
+  )
+
+  return (
+    freshestRequiredHeartbeat >= notBefore &&
+    componentIsHealthy(controller, referenceTime, RESETTING_COMPONENT_TIMEOUT_MS) &&
+    componentIsHealthy(motors, referenceTime, RESETTING_COMPONENT_TIMEOUT_MS) &&
+    componentIsHealthy(dispenser, referenceTime, RESETTING_COMPONENT_TIMEOUT_MS) &&
+    controller.resetting !== true &&
+    controller.reset_timed_out !== true &&
+    ['idle', 'finished'].includes(controllerState) &&
+    motorsState === 'ready' &&
+    dispenserState === 'ready'
+  )
+}
+
+export function listenForHardwareReady(options, callback, onError) {
+  const notBefore = Number(options?.notBefore) || 0
+
+  if (isFirebaseConfigured) {
+    let unsubscribe = () => {}
+    let cancelled = false
+
+    const initialize = async () => {
+      await firebaseAuthReady
+      if (cancelled) return
+
+      unsubscribe = onValue(
+        ref(realtimeDb, 'admin/component_status'),
+        (snapshot) => {
+          callback(hardwareCycleIsReady(snapshot.val() ?? {}, notBefore))
+        },
+        onError,
+      )
+    }
+
+    initialize().catch((error) => onError?.(error))
+
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
+  }
+
+  const checkLocalStatus = () => {
+    const admin = mergeAdminConfig(readLocal(ADMIN_KEY, ADMIN_DEFAULTS))
+    callback(hardwareCycleIsReady(admin.component_status ?? {}, notBefore))
+  }
+
+  checkLocalStatus()
+  const interval = window.setInterval(checkLocalStatus, 500)
+  return () => window.clearInterval(interval)
+}
+
 export async function getStaffSettings() {
   const [admin, sessions] = await Promise.all([getAdminConfig(), getSessions()])
   return {
@@ -649,16 +947,20 @@ export async function getSessions() {
 }
 
 export async function setGameEnabled(enabled) {
+  const payload = {
+    'settings/allow_new_games': enabled === true,
+    'game_control/manual_block': false,
+    'game_control/status': enabled ? 'ready' : 'blocked',
+  }
+
   if (isFirebaseConfigured) {
-    await update(ref(realtimeDb, 'admin'), {
-      'settings/allow_new_games': enabled,
-      'game_control/status': enabled ? 'ready' : 'blocked',
-    })
+    await safeAdminUpdate(payload)
     return
   }
 
   const admin = mergeAdminConfig(readLocal(ADMIN_KEY, ADMIN_DEFAULTS))
-  admin.settings.allow_new_games = enabled
+  admin.settings.allow_new_games = enabled === true
+  admin.game_control.manual_block = false
   admin.game_control.status = enabled ? 'ready' : 'blocked'
   writeLocal(ADMIN_KEY, admin)
 }
@@ -669,7 +971,7 @@ export async function setActiveSession(sessionId) {
   await ensureActiveSession()
 
   if (isFirebaseConfigured) {
-    await update(ref(realtimeDb, 'admin'), {
+    await safeAdminUpdate({
       'settings/active_session_id': sessionId,
     })
     return
@@ -815,11 +1117,11 @@ async function getAdminConfig() {
       const snapshot = await get(adminRef)
       if (snapshot.exists()) return mergeAdminConfig(snapshot.val())
 
-      await set(adminRef, ADMIN_DEFAULTS)
-      return mergeAdminConfig(ADMIN_DEFAULTS)
+      throw createAppError(ERROR_CODES.ADMIN_UNAVAILABLE, 'No se puede verificar el estado de Admin.')
     } catch (error) {
-      console.warn('Admin config unavailable, using local defaults.', error)
-      return mergeAdminConfig(ADMIN_DEFAULTS)
+      if (error?.code === ERROR_CODES.ADMIN_UNAVAILABLE) throw error
+      console.warn('Admin config unavailable.', error)
+      throw createAppError(ERROR_CODES.ADMIN_UNAVAILABLE, 'No se puede verificar el estado de Admin.')
     }
   }
 
@@ -833,10 +1135,11 @@ async function safeAdminUpdate(payload) {
     try {
       await firebaseAuthReady
       await update(ref(realtimeDb, 'admin'), payload)
+      return true
     } catch (error) {
       console.warn('Could not update admin node.', error)
+      throw error
     }
-    return
   }
 
   const admin = mergeAdminConfig(readLocal(ADMIN_KEY, ADMIN_DEFAULTS))
@@ -850,6 +1153,7 @@ async function safeAdminUpdate(payload) {
     cursor[parts.at(-1)] = value
   })
   writeLocal(ADMIN_KEY, admin)
+  return true
 }
 
 async function assertCanStartGame() {
@@ -983,34 +1287,15 @@ async function getUsersByPhone() {
   return readLocal(USERS_KEY, {})
 }
 
-async function refreshRankingPositions(sessionId = getActiveSessionId()) {
-  const [results, usersByPhone] = await Promise.all([getSessionResults(sessionId), getUsersByPhone()])
-  const bestResults = getBestResultsByParticipant(results, usersByPhone)
-  const rankByPhone = bestResults.reduce((acc, result, index) => {
-    acc[result.celular] = index + 1
-    return acc
-  }, {})
+async function getRankedSessionResults(sessionId = getActiveSessionId()) {
+  const [results, usersByPhone] = await Promise.all([
+    getSessionResults(sessionId),
+    getUsersByPhone(),
+  ])
+  const rankedResults = getBestResultsByParticipant(results, usersByPhone)
+    .map((result, index) => ({ ...result, puesto_ranking: index + 1 }))
 
-  if (isFirebaseConfigured) {
-    const updates = {}
-    results.forEach((result) => {
-      const phoneKey = getCanonicalPhoneKey(result.celular, usersByPhone)
-      updates[`game_results/${result.id}/puesto_ranking`] = rankByPhone[phoneKey] ?? null
-    })
-    if (Object.keys(updates).length > 0) await update(ref(realtimeDb), updates)
-  } else {
-    const storedResults = readLocal(RESULTS_KEY, {})
-    results.forEach((result) => {
-      const phoneKey = getCanonicalPhoneKey(result.celular, usersByPhone)
-      storedResults[result.id] = {
-        ...(storedResults[result.id] ?? {}),
-        puesto_ranking: rankByPhone[phoneKey] ?? null,
-      }
-    })
-    writeLocal(RESULTS_KEY, storedResults)
-  }
-
-  return bestResults.map((result, index) => ({ ...result, puesto_ranking: index + 1 }))
+  return { rankedResults, usersByPhone }
 }
 
 export async function createGameSession(participant) {
@@ -1032,9 +1317,7 @@ export async function createGameSession(participant) {
 
   if (isFirebaseConfigured) {
     const liveGameRef = push(ref(realtimeDb, `sessions/${sessionId}/live_games`))
-    await set(ref(realtimeDb, `sessions/${sessionId}/live_games`), {
-      [liveGameRef.key]: liveGame,
-    })
+    await set(liveGameRef, liveGame)
     await onDisconnect(liveGameRef).update({
       connection_state: 'disconnected',
       tablet_connected: false,
@@ -1088,44 +1371,160 @@ export function startGameHeartbeat(gameId) {
 }
 
 export function listenForVictory(gameId, callback) {
-  if (isFirebaseConfigured) {
-    const gameRef = ref(realtimeDb, `sessions/${getActiveSessionId()}/live_games/${gameId}`)
-    const finishSignalRef = ref(realtimeDb, 'admin/game_control/finish_signal')
-    let finishSignalInitialized = false
-    let lastFinishSignalToken = null
+  let cleanup = () => {}
+  let cancelled = false
 
-    const unsubscribeGame = onValue(gameRef, (snapshot) => {
-      const value = snapshot.val()
-      if (value?.status === 'won') callback(value)
-    })
-    const unsubscribeFinishSignal = onValue(finishSignalRef, (snapshot) => {
-      const value = snapshot.val()
-      const token = getStartSignalToken(value)
+  const initialize = async () => {
+    await firebaseAuthReady
+    if (cancelled) return
 
-      // Ignore the last signal already stored when a new game subscribes.
-      if (!finishSignalInitialized) {
-        finishSignalInitialized = true
-        lastFinishSignalToken = token
-        return
+    if (isFirebaseConfigured) {
+      const gameRef = ref(realtimeDb, `sessions/${getActiveSessionId()}/live_games/${gameId}`)
+      const finishSignalRef = ref(realtimeDb, 'admin/game_control/finish_signal')
+      let latestGame = null
+      let latestFinishSignal = null
+      let ackInProgress = false
+      let finishSignalInitialized = false
+      let initialFinishSignalRequestId = null
+      let initialFinishSignalWasActive = false
+      let finishSignalObservedAfterInitialization = false
+      const deliveredHardwareRequestIds = new Set()
+      let gameStatusVictoryDelivered = false
+
+      const deliverHardwareVictory = (value, requestId) => {
+        if (deliveredHardwareRequestIds.has(requestId)) return
+        deliveredHardwareRequestIds.add(requestId)
+        callback({ ...value, status: 'won', hardware_signal: true })
       }
 
-      if (!value?.active || !token || token === lastFinishSignalToken) return
-      lastFinishSignalToken = token
-      callback({ ...value, status: 'won', hardware_signal: true })
-    })
+      const finishSignalBelongsToCurrentGame = (value) => {
+        const detectedAt = Number(value?.detected_at)
+        const gameStartedAt = Number(latestGame?.started_at_client)
 
-    return () => {
-      unsubscribeGame()
-      unsubscribeFinishSignal()
+        if (!Number.isFinite(gameStartedAt)) return false
+
+        // When the ESP32 has NTP time, compare both Unix timestamps directly.
+        if (Number.isFinite(detectedAt) && detectedAt > 1_000_000_000_000) {
+          return detectedAt >= gameStartedAt - 2_000
+        }
+
+        // Before NTP synchronizes, the ESP32 can temporarily report millis().
+        // In that case, only trust a request observed after the listener's
+        // initial Firebase snapshot, which prevents accepting an old stale signal.
+        return finishSignalObservedAfterInitialization
+      }
+
+      const processLatestFinishSignal = async () => {
+        const value = latestFinishSignal
+        if (cancelled || ackInProgress || !value?.active) return
+
+        const requestId = value?.request_id ?? value?.requestId ?? null
+        if (!requestId) return
+        if (value?.acknowledged_request_id === requestId) return
+        if (!finishSignalBelongsToCurrentGame(value)) return
+
+        deliverHardwareVictory(value, requestId)
+        ackInProgress = true
+
+        try {
+          await safeAdminUpdate({
+            'game_control/finish_signal/active': false,
+            'game_control/finish_signal/acknowledged_at': now(),
+            'game_control/finish_signal/acknowledged_request_id': requestId,
+            'game_control/finish_signal/handled_by': 'web',
+            'game_control/finish_signal/detected_at': value?.detected_at ?? now(),
+            'game_control/finish_signal/request_id': requestId,
+          })
+
+          processedFinishSignalRequestIds = [
+            ...processedFinishSignalRequestIds.filter((id) => id !== requestId),
+            requestId,
+          ].slice(-20)
+        } catch (error) {
+          // Do not mark it as processed. The interval below retries the ACK.
+          console.warn('Could not acknowledge finish signal; retrying.', error)
+        } finally {
+          ackInProgress = false
+        }
+      }
+
+      const unsubscribeGame = onValue(
+        gameRef,
+        (snapshot) => {
+          latestGame = snapshot.val()
+
+          if (latestGame?.status === 'won' && !gameStatusVictoryDelivered) {
+            gameStatusVictoryDelivered = true
+            callback(latestGame)
+          }
+
+          processLatestFinishSignal().catch((error) =>
+            console.warn('Could not process finish signal.', error),
+          )
+        },
+        (error) => console.warn('Could not listen to live game.', error),
+      )
+
+      const unsubscribeFinishSignal = onValue(
+        finishSignalRef,
+        (snapshot) => {
+          latestFinishSignal = snapshot.val()
+          const requestId =
+            latestFinishSignal?.request_id ?? latestFinishSignal?.requestId ?? null
+
+          if (!finishSignalInitialized) {
+            finishSignalInitialized = true
+            initialFinishSignalRequestId = requestId
+            initialFinishSignalWasActive = latestFinishSignal?.active === true
+          } else if (
+            requestId &&
+            (
+              requestId !== initialFinishSignalRequestId ||
+              (!initialFinishSignalWasActive && latestFinishSignal?.active === true)
+            )
+          ) {
+            finishSignalObservedAfterInitialization = true
+          }
+
+          processLatestFinishSignal().catch((error) =>
+            console.warn('Could not process finish signal.', error),
+          )
+        },
+        (error) => console.warn('Could not listen to finish signal.', error),
+      )
+
+      const retryInterval = window.setInterval(() => {
+        processLatestFinishSignal().catch((error) =>
+          console.warn('Could not retry finish signal acknowledgment.', error),
+        )
+      }, 1_000)
+
+      cleanup = () => {
+        window.clearInterval(retryInterval)
+        unsubscribeGame()
+        unsubscribeFinishSignal()
+      }
+      return
     }
+
+    let victoryDelivered = false
+    const interval = window.setInterval(() => {
+      const liveGames = readLocal(LIVE_GAMES_KEY, {})
+      if (liveGames[gameId]?.status === 'won' && !victoryDelivered) {
+        victoryDelivered = true
+        callback(liveGames[gameId])
+      }
+    }, 250)
+
+    cleanup = () => window.clearInterval(interval)
   }
 
-  const interval = window.setInterval(() => {
-    const liveGames = readLocal(LIVE_GAMES_KEY, {})
-    if (liveGames[gameId]?.status === 'won') callback(liveGames[gameId])
-  }, 250)
+  initialize().catch((error) => console.warn('Could not initialize victory listener.', error))
 
-  return () => window.clearInterval(interval)
+  return () => {
+    cancelled = true
+    cleanup()
+  }
 }
 
 export async function signalVictory(gameId) {
@@ -1244,12 +1643,28 @@ export async function upsertParticipantResult(participant, elapsedMs, won) {
     writeLocal(RESULTS_KEY, results)
   }
 
-  const rankedResults = await refreshRankingPositions(sessionId)
-  const usersByPhone = await getUsersByPhone()
+  const { rankedResults, usersByPhone } = await getRankedSessionResults(sessionId)
   const participantKey = getCanonicalPhoneKey(user.phone, usersByPhone)
-  const rankedResult = rankedResults.find((entry) => entry.id === resultId || entry.celular === participantKey)
+  const rankedResult = rankedResults.find((entry) => entry.celular === participantKey)
+  const rank = rankedResult?.puesto_ranking ?? null
+
+  if (rank != null) {
+    if (isFirebaseConfigured) {
+      await update(ref(realtimeDb, `game_results/${resultId}`), {
+        puesto_ranking: rank,
+      })
+    } else {
+      const results = readLocal(RESULTS_KEY, {})
+      results[resultId] = {
+        ...(results[resultId] ?? resultPayload),
+        puesto_ranking: rank,
+      }
+      writeLocal(RESULTS_KEY, results)
+    }
+  }
+
   processRankingNotifications(sessionId, resultId)
-  return rankedResult?.puesto_ranking ?? null
+  return rank
 }
 
 export async function findParticipantByPhone(phone) {
@@ -1297,15 +1712,17 @@ export async function getParticipantRank(resultId) {
 
 export async function getRanking(max = 50) {
   const sessionId = await ensureActiveSession()
-  const [results, usersByPhone] = await Promise.all([
-    refreshRankingPositions(sessionId),
-    getUsersByPhone(),
-  ])
+  const { rankedResults, usersByPhone } = await getRankedSessionResults(sessionId)
 
-  return results
-    .sort((a, b) => a.tiempo_ms - b.tiempo_ms)
+  return rankedResults
     .slice(0, max)
-    .map((result, index) => toRankingEntry(result, getUserByPhoneKey(usersByPhone, result.celular), index + 1))
+    .map((result, index) =>
+      toRankingEntry(
+        result,
+        getUserByPhoneKey(usersByPhone, result.celular),
+        index + 1,
+      ),
+    )
 }
 
 export function listenRanking(max = 50, callback, onError) {

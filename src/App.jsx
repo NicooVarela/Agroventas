@@ -23,6 +23,7 @@ import {
   isFirebaseConfigured,
   interruptGameSession,
   listenAdminHealth,
+  listenForHardwareReady,
   listenForVictory,
   listenForPhysicalStart,
   listenRanking,
@@ -40,6 +41,7 @@ import {
 } from './firebaseClient'
 
 const GAME_DURATION_MS = 60_000
+const TIMER_RENDER_INTERVAL_MS = 100
 const RESULT_SCREEN_MS = 6_500
 const RESET_SCREEN_MS = 3_000
 const CONTENT_STORAGE_KEY = 'agroventas.cms_content'
@@ -373,11 +375,14 @@ function App() {
     message: '',
     blockedComponents: [],
   })
-  const timerRef = useRef(null)
   const victoryLockRef = useRef(false)
   const adminBlockedRef = useRef(false)
   const screenRef = useRef(screen)
   const adminHealthRef = useRef(adminHealth)
+  const startedAtRef = useRef(startedAt)
+  const elapsedMsRef = useRef(elapsedMs)
+  const finishGameRef = useRef(null)
+  const resetWaitStartedAtRef = useRef(0)
   const staffTapsRef = useRef(0)
   const staffLastTapAtRef = useRef(0)
   const staffTapTimeoutRef = useRef(null)
@@ -441,7 +446,23 @@ function App() {
 
   useEffect(() => {
     if (IS_VISUAL_PREVIEW) return undefined
-    return listenAdminHealth(setAdminHealth)
+
+    return listenAdminHealth((nextHealth) => {
+      setAdminHealth((currentHealth) => {
+        const currentComponents = currentHealth.blockedComponents ?? []
+        const nextComponents = nextHealth.blockedComponents ?? []
+        const sameComponents =
+          currentComponents.length === nextComponents.length &&
+          currentComponents.every((component, index) => component === nextComponents[index])
+        const unchanged =
+          currentHealth.blocked === nextHealth.blocked &&
+          currentHealth.code === nextHealth.code &&
+          currentHealth.message === nextHealth.message &&
+          sameComponents
+
+        return unchanged ? currentHealth : nextHealth
+      })
+    })
   }, [])
 
   useEffect(() => {
@@ -459,6 +480,14 @@ function App() {
   useEffect(() => {
     adminHealthRef.current = adminHealth
   }, [adminHealth])
+
+  useEffect(() => {
+    startedAtRef.current = startedAt
+  }, [startedAt])
+
+  useEffect(() => {
+    elapsedMsRef.current = elapsedMs
+  }, [elapsedMs])
 
   useEffect(() => {
     if (IS_VISUAL_PREVIEW) return undefined
@@ -518,7 +547,6 @@ function App() {
       if (adminBlockedRef.current) return
       const activeSessionId = sessionId
       adminBlockedRef.current = true
-      if (timerRef.current) window.clearInterval(timerRef.current)
       if (activeSessionId) {
         interruptGameSession(activeSessionId, adminHealth.code ?? 'admin_blocked').catch((error) =>
           setErrorMessage(formatError('FB-007', 'No se pudo marcar la partida como interrumpida.', error)),
@@ -535,15 +563,14 @@ function App() {
   }, [adminHealth.blocked, adminHealth.code, resetKioskToIdle, sessionId])
 
   useEffect(() => {
-    if (screen === 'idle' || screen === 'result') {
-      const timeout = window.setTimeout(() => {
-        loadRanking().catch((error) =>
-          setErrorMessage(formatError('FB-001', 'No se pudo cargar el ranking.', error)),
-        )
-      }, 0)
-      return () => window.clearTimeout(timeout)
-    }
-    return undefined
+    if (screen !== 'idle') return undefined
+
+    const timeout = window.setTimeout(() => {
+      loadRanking().catch((error) =>
+        setErrorMessage(formatError('FB-001', 'No se pudo cargar el ranking.', error)),
+      )
+    }, 0)
+    return () => window.clearTimeout(timeout)
   }, [screen, loadRanking])
 
   useEffect(() => {
@@ -559,108 +586,163 @@ function App() {
   useEffect(() => {
     if (screen !== 'countdown' || IS_VISUAL_PREVIEW) return undefined
 
+    let playTimeout = null
+    let cancelled = false
     const steps = [2, 1, 'YA']
     const timeouts = steps.map((step, index) =>
       window.setTimeout(() => {
+        if (cancelled || screenRef.current !== 'countdown') return
+
         setCountdown(step)
         if (step === 'YA') {
-          window.setTimeout(() => {
-            setStartedAt(Date.now())
-            setElapsedMs(0)
-            setMotorsEnabled(true).catch((error) =>
-              setErrorMessage(formatError('FB-014', 'No se pudo habilitar los motores.', error)),
-            )
-            setScreen('playing')
+          playTimeout = window.setTimeout(async () => {
+            if (
+              cancelled ||
+              screenRef.current !== 'countdown' ||
+              adminHealthRef.current.blocked
+            ) {
+              return
+            }
+
+            try {
+              await setMotorsEnabled(true)
+
+              if (
+                cancelled ||
+                screenRef.current !== 'countdown' ||
+                adminHealthRef.current.blocked
+              ) {
+                await setMotorsEnabled(false)
+                return
+              }
+
+              setStartedAt(Date.now())
+              setElapsedMs(0)
+              setScreen('playing')
+            } catch (error) {
+              setErrorMessage(formatError('FB-014', 'No se pudo habilitar los motores.', error))
+            }
           }, 780)
         }
       }, (index + 1) * 1000),
     )
 
-    return () => timeouts.forEach(window.clearTimeout)
+    return () => {
+      cancelled = true
+      timeouts.forEach(window.clearTimeout)
+      if (playTimeout !== null) window.clearTimeout(playTimeout)
+    }
   }, [screen])
 
-  const resetFlow = useCallback(() => {
+  const completeResetToIdle = useCallback(() => {
+    victoryLockRef.current = false
+    resetWaitStartedAtRef.current = 0
+    setForm(initialForm)
+    setPhonePrefix(PHONE_PREFIX_OPTIONS[0].code)
+    setFormErrors({})
+    setReturningPhone('')
+    setReturningPhonePrefix(PHONE_PREFIX_OPTIONS[0].code)
+    setReturningError('')
+    setSelectedProfile('')
+    setParticipant(null)
+    setSessionId(null)
+    setCountdown(null)
+    setStartedAt(null)
+    setElapsedMs(0)
+    setResult(null)
+    setErrorMessage('')
+    setScreen('idle')
+  }, [])
+
+  const beginResetFlow = useCallback(() => {
+    resetWaitStartedAtRef.current = Date.now()
     setMotorsEnabled(false).catch((error) =>
       setErrorMessage(formatError('FB-013', 'No se pudo apagar los motores.', error)),
     )
     setScreen('resetting')
-    window.setTimeout(() => {
-      victoryLockRef.current = false
-      setForm(initialForm)
-      setPhonePrefix(PHONE_PREFIX_OPTIONS[0].code)
-      setFormErrors({})
-      setReturningPhone('')
-      setReturningPhonePrefix(PHONE_PREFIX_OPTIONS[0].code)
-      setReturningError('')
-      setSelectedProfile('')
-      setParticipant(null)
-      setSessionId(null)
-      setCountdown(null)
-      setStartedAt(null)
-      setElapsedMs(0)
-      setResult(null)
-      setErrorMessage('')
-      setScreen('idle')
-    }, RESET_SCREEN_MS)
   }, [])
 
   const finishGame = useCallback(
     async (won, explicitElapsedMs) => {
       if (victoryLockRef.current) return
       victoryLockRef.current = true
-      setMotorsEnabled(false).catch((error) =>
-        setErrorMessage(formatError('FB-013', 'No se pudo apagar los motores.', error)),
-      )
 
       const finalElapsedMs = Math.min(
         GAME_DURATION_MS,
-        Math.max(0, explicitElapsedMs ?? elapsedMs),
+        Math.max(0, explicitElapsedMs ?? elapsedMsRef.current),
       )
+
       setElapsedMs(finalElapsedMs)
+      setResult({
+        won,
+        rank: null,
+        rankLoading: won,
+        rankError: false,
+        saveError: false,
+        elapsedMs: finalElapsedMs,
+        isTopThree: false,
+        participant,
+      })
+      setScreen('result')
 
       try {
         await finishGameSession(sessionId, won ? 'won' : 'lost', finalElapsedMs)
-        const rank = await upsertParticipantResult(participant, finalElapsedMs, won)
-        const nextResult = {
-          won,
-          rank,
-          elapsedMs: finalElapsedMs,
-          isTopThree: won && rank && rank <= 3,
-          participant,
+
+        if (won) {
+          const rank = await upsertParticipantResult(participant, finalElapsedMs, true)
+          setResult((currentResult) =>
+            currentResult
+              ? {
+                  ...currentResult,
+                  rank,
+                  rankLoading: false,
+                  rankError: rank == null,
+                  isTopThree: Boolean(rank && rank <= 3),
+                }
+              : currentResult,
+          )
         }
-        setResult(nextResult)
-        setScreen('result')
       } catch (error) {
+        setResult((currentResult) =>
+          currentResult
+            ? {
+                ...currentResult,
+                rankLoading: false,
+                rankError: won,
+                saveError: true,
+              }
+            : currentResult,
+        )
         setErrorMessage(formatError('FB-002', 'No se pudo guardar el resultado.', error))
-        victoryLockRef.current = false
       }
     },
-    [elapsedMs, participant, sessionId],
+    [participant, sessionId],
   )
 
   useEffect(() => {
-    if (screen !== 'playing' || !startedAt || IS_VISUAL_PREVIEW) return undefined
+    finishGameRef.current = finishGame
+  }, [finishGame])
 
-    timerRef.current = window.setInterval(() => {
-      const nextElapsed = msUntil(startedAt)
-      setElapsedMs(Math.min(nextElapsed, GAME_DURATION_MS))
-      if (nextElapsed >= GAME_DURATION_MS) {
-        window.clearInterval(timerRef.current)
-        finishGame(false, GAME_DURATION_MS)
-      }
-    }, 33)
-
-    return () => window.clearInterval(timerRef.current)
-  }, [finishGame, screen, startedAt])
 
   useEffect(() => {
-    if (screen !== 'playing' || !sessionId) return undefined
+    if (!sessionId || IS_VISUAL_PREVIEW) {
+      return undefined
+    }
 
     return listenForVictory(sessionId, () => {
-      const finalElapsed = startedAt ? msUntil(startedAt) : elapsedMs
-      finishGame(true, finalElapsed)
+      if (screenRef.current !== 'playing') {
+        return
+      }
+
+      const currentStartedAt = startedAtRef.current
+      if (!currentStartedAt) {
+        return
+      }
+
+      const finalElapsed = msUntil(currentStartedAt)
+      finishGameRef.current?.(true, finalElapsed)
     })
-  }, [elapsedMs, finishGame, screen, sessionId, startedAt])
+  }, [sessionId])
 
   useEffect(() => {
     if (screen !== 'playing' || !sessionId) return undefined
@@ -669,22 +751,32 @@ function App() {
 
   useEffect(() => {
     if (screen !== 'result' || IS_VISUAL_PREVIEW) return undefined
-    const timeout = window.setTimeout(() => resetFlow(), RESULT_SCREEN_MS)
+    const timeout = window.setTimeout(() => beginResetFlow(), RESULT_SCREEN_MS)
     return () => window.clearTimeout(timeout)
-  }, [resetFlow, screen])
+  }, [beginResetFlow, screen])
 
-  const remainingMs = Math.max(0, GAME_DURATION_MS - elapsedMs)
-  const pressureLevel =
-    screen !== 'playing'
-      ? ''
-      : remainingMs <= 10_000
-        ? 'critical-mode'
-        : remainingMs <= 15_000
-          ? 'urgent-mode'
-          : remainingMs <= 30_000
-            ? 'warning-mode'
-            : ''
-  const progress = Math.min(100, (remainingMs / GAME_DURATION_MS) * 100)
+  useEffect(() => {
+    if (screen !== 'resetting') return undefined
+
+    if (IS_VISUAL_PREVIEW || !isFirebaseConfigured) {
+      const timeout = window.setTimeout(completeResetToIdle, RESET_SCREEN_MS)
+      return () => window.clearTimeout(timeout)
+    }
+
+    return listenForHardwareReady(
+      { notBefore: resetWaitStartedAtRef.current },
+      (ready) => {
+        if (ready && screenRef.current === 'resetting') {
+          completeResetToIdle()
+        }
+      },
+      (error) =>
+        setErrorMessage(
+          formatError('FB-015', 'No se pudo verificar que la máquina quedara lista.', error),
+        ),
+    )
+  }, [completeResetToIdle, screen])
+
 
   const resultStateClass = screen === 'result' && result ? (result.won ? 'result-won' : 'result-lost') : ''
   const showBrandHeader = false
@@ -998,7 +1090,7 @@ function App() {
 
   return (
     <main
-      className={`app-shell screen-${screen} ${resultStateClass} countdown-${countdown} ${pressureLevel} ${keyboardOpen ? 'keyboard-open' : ''}`}
+      className={`app-shell screen-${screen} ${resultStateClass} countdown-${countdown} ${keyboardOpen ? 'keyboard-open' : ''}`}
       style={{ height: viewportHeight, minHeight: viewportHeight }}
       onPointerDownCapture={handleGlobalStaffTap}
     >
@@ -1189,20 +1281,10 @@ function App() {
 
       {screen === 'playing' && (
         <section className="screen playing-screen">
-            <div className="timer-wrap" style={{ '--timer-progress': progress / 100 }}>
-              <svg className="timer-ring" viewBox="0 0 360 360" aria-hidden="true">
-                <defs>
-                  <linearGradient id="timerGradient" x1="68" y1="292" x2="292" y2="68" gradientUnits="userSpaceOnUse">
-                    <stop className="timer-stop-a" offset="0%" />
-                    <stop className="timer-stop-b" offset="52%" />
-                    <stop className="timer-stop-c" offset="100%" />
-                  </linearGradient>
-                </defs>
-                <circle className="timer-ring-track" cx="180" cy="180" r="140" />
-                <circle className="timer-ring-progress" cx="180" cy="180" r="140" pathLength="100" />
-              </svg>
-              <div className="timer">{formatTime(remainingMs)}</div>
-          </div>
+          <GameTimer
+            startedAt={startedAt}
+            onExpired={() => finishGameRef.current?.(false, GAME_DURATION_MS)}
+          />
           {(adminOpen || IS_VISUAL_PREVIEW) && (
             <>
               <button className="staff-win" type="button" onClick={handleSimulateVictory}>
@@ -1226,8 +1308,14 @@ function App() {
                 <span className="result-icon-badge" aria-hidden="true">
                   <Medal size={42} />
                 </span>
-                <span className="result-rank-label">{content.resultWon.rankLabel}</span>
-                <em>¡{result.rank ?? '-'}!</em>
+                <span className="result-rank-label">
+                  {result.rankLoading
+                    ? 'Calculando posición...'
+                    : result.rankError
+                      ? 'Posición pendiente'
+                      : content.resultWon.rankLabel}
+                </span>
+                <em>{result.rankLoading ? '...' : `¡${result.rank ?? '-'}!`}</em>
                 <span className="result-divider" aria-hidden="true" />
                 <strong>{result.participant.name}</strong>
                 <span className="result-time">{content.resultWon.timeLabel}: {formatTime(result.elapsedMs)}</span>
@@ -1373,6 +1461,79 @@ function App() {
 
       {errorMessage && <div className="toast">{errorMessage}</div>}
     </main>
+  )
+}
+
+function GameTimer({ startedAt, onExpired }) {
+  const [visualElapsedMs, setVisualElapsedMs] = useState(0)
+  const onExpiredRef = useRef(onExpired)
+  const expiredRef = useRef(false)
+
+  useEffect(() => {
+    onExpiredRef.current = onExpired
+  }, [onExpired])
+
+  useEffect(() => {
+    if (!startedAt) return undefined
+
+    expiredRef.current = false
+
+    const updateTimer = () => {
+      const nextElapsed = Math.min(msUntil(startedAt), GAME_DURATION_MS)
+      setVisualElapsedMs(nextElapsed)
+
+      if (nextElapsed >= GAME_DURATION_MS && !expiredRef.current) {
+        expiredRef.current = true
+        onExpiredRef.current?.()
+      }
+    }
+
+    updateTimer()
+    const interval = window.setInterval(updateTimer, TIMER_RENDER_INTERVAL_MS)
+    return () => window.clearInterval(interval)
+  }, [startedAt])
+
+  const remainingMs = Math.max(0, GAME_DURATION_MS - visualElapsedMs)
+  const pressureLevel =
+    remainingMs <= 10_000
+      ? 'critical-mode'
+      : remainingMs <= 15_000
+        ? 'urgent-mode'
+        : remainingMs <= 30_000
+          ? 'warning-mode'
+          : ''
+  const progress = Math.min(100, (remainingMs / GAME_DURATION_MS) * 100)
+
+  return (
+    <div className={`timer-stage ${pressureLevel}`}>
+      <div className="timer-wrap" style={{ '--timer-progress': progress / 100 }}>
+        <svg className="timer-ring" viewBox="0 0 360 360" aria-hidden="true">
+          <defs>
+            <linearGradient
+              id="timerGradient"
+              x1="68"
+              y1="292"
+              x2="292"
+              y2="68"
+              gradientUnits="userSpaceOnUse"
+            >
+              <stop className="timer-stop-a" offset="0%" />
+              <stop className="timer-stop-b" offset="52%" />
+              <stop className="timer-stop-c" offset="100%" />
+            </linearGradient>
+          </defs>
+          <circle className="timer-ring-track" cx="180" cy="180" r="140" />
+          <circle
+            className="timer-ring-progress"
+            cx="180"
+            cy="180"
+            r="140"
+            pathLength="100"
+          />
+        </svg>
+        <div className="timer">{formatTime(remainingMs)}</div>
+      </div>
+    </div>
   )
 }
 

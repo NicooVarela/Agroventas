@@ -1,0 +1,45 @@
+{
+  "rules": {
+    ".read": "auth != null",
+    ".write": "auth != null",
+    "users": {
+      ".read": "auth != null",
+      ".write": "auth != null",
+      "$celular": {
+        ".validate": "newData.hasChildren(['nombre', 'email', 'celular', 'perfil_productor'])"
+      }
+    },
+    "game_results": {
+      ".read": "auth != null",
+      ".write": "auth != null",
+      ".indexOn": ["session_id"],
+      "$result_id": {
+        ".validate": "newData.hasChildren(['celular', 'session_id', 'tiempo_ms', 'completado_at'])"
+      }
+    },
+    "sessions": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "admin": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "admin/component_status": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "admin/components": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "admin/game_control": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "notifications": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    }
+  }
+}
