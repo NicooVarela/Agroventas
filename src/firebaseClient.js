@@ -158,6 +158,24 @@ const ADMIN_DEFAULTS = {
       acknowledged_request_id: null,
       handled_by: null,
     },
+    home_calibration: {
+      active: false,
+      request_id: null,
+      requested_at: null,
+      expires_at: null,
+      source: null,
+      status: 'idle',
+      accepted_at: null,
+      acknowledged_request_id: null,
+      completed_at: null,
+      cancelled_at: null,
+      timed_out_at: null,
+      responded_at: null,
+      handled_by: null,
+      motor_1_position: null,
+      motor_2_position: null,
+      error: null,
+    },
   },
   interrupted_game: {
     active: false,
@@ -176,6 +194,8 @@ const ERROR_CODES = {
   ADMIN_GLOBAL_START_BLOCKED: 'ADM-002',
   ADMIN_COMPONENTS_BLOCKED: 'ADM-003',
   ADMIN_UNAVAILABLE: 'ADM-004',
+  CALIBRATION_ACTIVE: 'ADM-006',
+  CALIBRATION_NOT_READY: 'CAL-001',
 }
 
 function readLocal(key, fallback) {
@@ -257,6 +277,10 @@ function mergeAdminConfig(config = {}) {
         ...ADMIN_DEFAULTS.game_control.finish_signal,
         ...(gameControlConfig.finish_signal ?? {}),
       },
+      home_calibration: {
+        ...ADMIN_DEFAULTS.game_control.home_calibration,
+        ...(gameControlConfig.home_calibration ?? {}),
+      },
     },
     interrupted_game: { ...ADMIN_DEFAULTS.interrupted_game, ...(config.interrupted_game ?? {}) },
     errors: { ...ADMIN_DEFAULTS.errors, ...(config.errors ?? {}) },
@@ -303,6 +327,7 @@ function getComponentHealthFromStatus(componentStatus = {}) {
       'dispensing_close',
       'returning_home',
       'waiting_for_home',
+      'calibrating',
       'busy',
     ].includes(controllerState)
   const effectiveTimeoutMs = controllerBusy
@@ -596,9 +621,18 @@ export function startComponentStatusMonitor(getCurrentScreen) {
         const currentAdmin = mergeAdminConfig(latestAdminConfig)
         const currentLastError = currentAdmin.errors?.last_error ?? null
         const manualBlocked = currentAdmin.game_control?.manual_block === true
+        const calibrationActive = currentAdmin.game_control?.home_calibration?.active === true
         const componentsOk = allOk
-        const canStart = currentAdmin.settings.allow_new_games === true && componentsOk && !manualBlocked
-        const nextStatus = manualBlocked ? 'blocked' : (allOk ? 'ready' : 'component_error')
+        const canStart =
+          currentAdmin.settings.allow_new_games === true &&
+          componentsOk &&
+          !manualBlocked &&
+          !calibrationActive
+        const nextStatus = calibrationActive
+          ? 'calibrating'
+          : manualBlocked
+            ? 'blocked'
+            : (allOk ? 'ready' : 'component_error')
 
         let nextLastError = currentLastError
         if (!allOk) {
@@ -722,11 +756,20 @@ export function startComponentStatusMonitor(getCurrentScreen) {
     const allOk = getRequiredComponentsOk(admin.components)
     const currentLastError = admin.errors?.last_error
     const manualBlocked = admin.game_control?.manual_block === true
+    const calibrationActive = admin.game_control?.home_calibration?.active === true
     const componentsOk = allOk
-    const canStart = admin.settings.allow_new_games === true && componentsOk && !manualBlocked
+    const canStart =
+      admin.settings.allow_new_games === true &&
+      componentsOk &&
+      !manualBlocked &&
+      !calibrationActive
     admin.game_control.components_ok = componentsOk
     admin.game_control.can_start = canStart
-    admin.game_control.status = manualBlocked ? 'blocked' : (allOk ? 'ready' : 'component_error')
+    admin.game_control.status = calibrationActive
+      ? 'calibrating'
+      : manualBlocked
+        ? 'blocked'
+        : (allOk ? 'ready' : 'component_error')
     let nextLastError = currentLastError ?? null
     if (!allOk) {
       nextLastError = {
@@ -861,6 +904,128 @@ export async function setMotorsEnabled(enabled) {
   await safeAdminUpdate({
     'game_control/motors_enabled': enabled === true,
   })
+}
+
+
+function getCalibrationRequestId() {
+  return typeof crypto !== 'undefined' && crypto.randomUUID
+    ? `calibration_${crypto.randomUUID()}`
+    : `calibration_${now()}_${Math.random().toString(16).slice(2)}`
+}
+
+function calibrationMachineIsReady(admin) {
+  const referenceTime = now()
+  const controller = admin.component_status?.esp32 ?? {}
+  const motors = admin.component_status?.motors ?? {}
+  const dispenser = admin.component_status?.dispenser ?? {}
+  const controllerState = String(controller.current_state ?? '').toLowerCase()
+  const motorsState = String(motors.current_state ?? '').toLowerCase()
+  const dispenserState = String(dispenser.current_state ?? '').toLowerCase()
+  const allowedControllerState = ['idle', 'finished', 'error'].includes(controllerState)
+
+  return (
+    allowedControllerState &&
+    controller.resetting !== true &&
+    admin.game_control?.motors_enabled !== true &&
+    admin.game_control?.home_calibration?.active !== true &&
+    componentIsAlive(controller, referenceTime, RESETTING_COMPONENT_TIMEOUT_MS) &&
+    componentIsAlive(motors, referenceTime, RESETTING_COMPONENT_TIMEOUT_MS) &&
+    componentIsAlive(dispenser, referenceTime, RESETTING_COMPONENT_TIMEOUT_MS) &&
+    motorsState !== 'enabled' &&
+    !['returning_home', 'resetting', 'dispensing'].includes(motorsState) &&
+    !['open', 'closing', 'busy'].includes(dispenserState)
+  )
+}
+
+export async function requestHomeCalibration() {
+  const admin = await getAdminConfig()
+
+  if (!calibrationMachineIsReady(admin)) {
+    throw createAppError(
+      ERROR_CODES.CALIBRATION_NOT_READY,
+      'La máquina debe estar detenida y sin un retorno o dispensado en curso.',
+    )
+  }
+
+  const requestId = getCalibrationRequestId()
+  const requestedAt = now()
+
+  await safeAdminUpdate({
+    'game_control/motors_enabled': false,
+    'game_control/can_start': false,
+    'game_control/status': 'calibrating',
+    'game_control/home_calibration/active': true,
+    'game_control/home_calibration/request_id': requestId,
+    'game_control/home_calibration/requested_at': requestedAt,
+    'game_control/home_calibration/expires_at': requestedAt + 60_000,
+    'game_control/home_calibration/source': 'dev_panel',
+    'game_control/home_calibration/status': 'requested',
+    'game_control/home_calibration/accepted_at': null,
+    'game_control/home_calibration/acknowledged_request_id': null,
+    'game_control/home_calibration/completed_at': null,
+    'game_control/home_calibration/cancelled_at': null,
+    'game_control/home_calibration/timed_out_at': null,
+    'game_control/home_calibration/responded_at': null,
+    'game_control/home_calibration/handled_by': null,
+    'game_control/home_calibration/motor_1_position': null,
+    'game_control/home_calibration/motor_2_position': null,
+    'game_control/home_calibration/error': null,
+  })
+
+  return requestId
+}
+
+export async function cancelHomeCalibration(requestId) {
+  if (!requestId) return
+
+  await safeAdminUpdate({
+    'game_control/home_calibration/active': false,
+    'game_control/home_calibration/request_id': requestId,
+    'game_control/home_calibration/status': 'cancelled',
+    'game_control/home_calibration/cancelled_at': now(),
+    'game_control/home_calibration/error': 'cancelled_from_dev_panel',
+  })
+}
+
+export function listenHomeCalibration(requestId, callback, onError) {
+  if (!requestId) return () => {}
+
+  if (isFirebaseConfigured) {
+    let unsubscribe = () => {}
+    let cancelled = false
+
+    const initialize = async () => {
+      await firebaseAuthReady
+      if (cancelled) return
+
+      unsubscribe = onValue(
+        ref(realtimeDb, 'admin/game_control/home_calibration'),
+        (snapshot) => {
+          const value = snapshot.val() ?? {}
+          if (value.request_id !== requestId) return
+          callback(value)
+        },
+        onError,
+      )
+    }
+
+    initialize().catch((error) => onError?.(error))
+
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
+  }
+
+  const emitLocal = () => {
+    const admin = mergeAdminConfig(readLocal(ADMIN_KEY, ADMIN_DEFAULTS))
+    const value = admin.game_control.home_calibration ?? {}
+    if (value.request_id === requestId) callback(value)
+  }
+
+  emitLocal()
+  const interval = window.setInterval(emitLocal, 300)
+  return () => window.clearInterval(interval)
 }
 
 function hardwareCycleIsReady(componentStatus = {}, notBefore = 0) {
@@ -1159,11 +1324,21 @@ async function safeAdminUpdate(payload) {
 async function assertCanStartGame() {
   const admin = await getAdminConfig()
   const health = getAdminHealth(admin)
+  const calibrationActive = admin.game_control?.home_calibration?.active === true
 
   await safeAdminUpdate({
     'game_control/last_check_at': now(),
-    'game_control/status': health.blocked ? 'blocked' : 'ready',
+    'game_control/status': calibrationActive
+      ? 'calibrating'
+      : (health.blocked ? 'blocked' : 'ready'),
   })
+
+  if (calibrationActive) {
+    throw createAppError(
+      ERROR_CODES.CALIBRATION_ACTIVE,
+      'El punto inicial se está configurando. Esperá a que termine la calibración.',
+    )
+  }
 
   if (health.blocked) throw createAppError(health.code, health.message)
 }

@@ -24,6 +24,7 @@ import {
   interruptGameSession,
   listenAdminHealth,
   listenForHardwareReady,
+  listenHomeCalibration,
   listenForVictory,
   listenForPhysicalStart,
   listenRanking,
@@ -32,6 +33,8 @@ import {
   startComponentStatusMonitor,
   signalVictory,
   signalPhysicalStart,
+  requestHomeCalibration,
+  cancelHomeCalibration,
   setMotorsEnabled,
   startGameHeartbeat,
   createFairSession,
@@ -366,6 +369,12 @@ function App() {
   const [staffActiveSessionId, setStaffActiveSessionId] = useState('')
   const [staffGameEnabled, setStaffGameEnabled] = useState(true)
   const [newSessionName, setNewSessionName] = useState('')
+  const [calibrationModalOpen, setCalibrationModalOpen] = useState(false)
+  const [calibrationRequestId, setCalibrationRequestId] = useState(null)
+  const [calibrationStatus, setCalibrationStatus] = useState('idle')
+  const [calibrationDetails, setCalibrationDetails] = useState(null)
+  const [calibrationError, setCalibrationError] = useState('')
+  const [calibrationBusy, setCalibrationBusy] = useState(false)
   const [isBusy, setIsBusy] = useState(false)
   const [dataMessage, setDataMessage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
@@ -379,6 +388,7 @@ function App() {
   const adminBlockedRef = useRef(false)
   const screenRef = useRef(screen)
   const adminHealthRef = useRef(adminHealth)
+  const calibrationActiveRef = useRef(false)
   const startedAtRef = useRef(startedAt)
   const elapsedMsRef = useRef(elapsedMs)
   const finishGameRef = useRef(null)
@@ -482,6 +492,12 @@ function App() {
   }, [adminHealth])
 
   useEffect(() => {
+    calibrationActiveRef.current =
+      calibrationModalOpen &&
+      !['completed', 'cancelled', 'timeout', 'rejected_busy', 'error'].includes(calibrationStatus)
+  }, [calibrationModalOpen, calibrationStatus])
+
+  useEffect(() => {
     startedAtRef.current = startedAt
   }, [startedAt])
 
@@ -498,7 +514,7 @@ function App() {
     () => {
       if (IS_VISUAL_PREVIEW) return undefined
       return listenForPhysicalStart(() => {
-        if (adminHealthRef.current.blocked) {
+        if (calibrationActiveRef.current || adminHealthRef.current.blocked) {
           return false
         }
 
@@ -777,6 +793,28 @@ function App() {
     )
   }, [completeResetToIdle, screen])
 
+  useEffect(() => {
+    if (!calibrationRequestId) return undefined
+
+    return listenHomeCalibration(
+      calibrationRequestId,
+      (value) => {
+        const nextStatus = value?.status ?? 'requested'
+        setCalibrationDetails(value)
+        setCalibrationStatus(nextStatus)
+        setCalibrationError(value?.error ?? '')
+
+        if (nextStatus === 'completed') {
+          setDataMessage('Punto inicial configurado correctamente.')
+        }
+      },
+      (error) => {
+        setCalibrationStatus('error')
+        setCalibrationError(formatError('CAL-002', 'No se pudo seguir la calibración.', error))
+      },
+    )
+  }, [calibrationRequestId])
+
 
   const resultStateClass = screen === 'result' && result ? (result.won ? 'result-won' : 'result-lost') : ''
   const showBrandHeader = false
@@ -824,7 +862,7 @@ function App() {
   }
 
   function handleGlobalStaffTap(event) {
-    if (adminOpen || event.target.closest('.admin-panel')) return
+    if (calibrationModalOpen || adminOpen || event.target.closest('.admin-panel')) return
 
     const tapTime = event.timeStamp
     const isRapidTap = tapTime - staffLastTapAtRef.current < 650
@@ -969,6 +1007,57 @@ function App() {
     if (screen === 'playing') {
       finishGame(false, GAME_DURATION_MS)
     }
+  }
+
+  async function handleStartHomeCalibration() {
+    setCalibrationModalOpen(true)
+    setCalibrationRequestId(null)
+    setCalibrationDetails(null)
+    setCalibrationStatus('requesting')
+    setCalibrationError('')
+    setCalibrationBusy(true)
+    setAdminOpen(false)
+
+    try {
+      const requestId = await requestHomeCalibration()
+      setCalibrationRequestId(requestId)
+      setCalibrationStatus('requested')
+    } catch (error) {
+      setCalibrationStatus('error')
+      setCalibrationError(
+        error?.userMessage ?? formatError('CAL-001', 'No se pudo iniciar la calibración.', error),
+      )
+    } finally {
+      setCalibrationBusy(false)
+    }
+  }
+
+  async function handleCancelHomeCalibration() {
+    if (!calibrationRequestId) {
+      setCalibrationModalOpen(false)
+      setCalibrationStatus('idle')
+      setCalibrationError('')
+      return
+    }
+
+    setCalibrationBusy(true)
+    try {
+      await cancelHomeCalibration(calibrationRequestId)
+      setCalibrationStatus('cancelled')
+      setCalibrationError('')
+    } catch (error) {
+      setCalibrationError(formatError('CAL-003', 'No se pudo cancelar la calibración.', error))
+    } finally {
+      setCalibrationBusy(false)
+    }
+  }
+
+  function handleCloseHomeCalibration() {
+    setCalibrationModalOpen(false)
+    setCalibrationRequestId(null)
+    setCalibrationDetails(null)
+    setCalibrationStatus('idle')
+    setCalibrationError('')
   }
 
   async function handleSimulatePhysicalStart() {
@@ -1386,6 +1475,19 @@ function App() {
             </button>
           </div>
           <div className="admin-section">
+            <strong>Mantenimiento</strong>
+            <button
+              type="button"
+              onClick={handleStartHomeCalibration}
+              disabled={isBusy || calibrationBusy || screen !== 'idle'}
+            >
+              Configurar punto cero de los NEMA
+            </button>
+            <small>
+              Colocá la plataforma en la base y confirmá con el botón físico.
+            </small>
+          </div>
+          <div className="admin-section">
             <strong>Feria activa</strong>
             <select
               value={staffActiveSessionId}
@@ -1455,6 +1557,70 @@ function App() {
             <button type="button" onClick={() => setAdminOpen(true)}>
               {content.blocker.button}
             </button>
+          </div>
+        </div>
+      )}
+
+      {calibrationModalOpen && (
+        <div className="global-blocker" role="dialog" aria-modal="true" aria-labelledby="calibration-title">
+          <div className="global-blocker-card">
+            <Settings size={58} />
+            <p className="eyebrow">Mantenimiento</p>
+            <h1 id="calibration-title">Configurar punto inicial</h1>
+
+            {['requesting', 'requested'].includes(calibrationStatus) && (
+              <>
+                <p>Enviando la solicitud a la ESP32 y esperando que la máquina quede bloqueada.</p>
+                <strong>No aprietes todavía el botón físico.</strong>
+              </>
+            )}
+
+            {calibrationStatus === 'waiting_for_button' && (
+              <>
+                <p>
+                  Mové manualmente la plataforma hasta dejarla alineada en su posición inicial.
+                </p>
+                <strong>Ahora apretá una vez el botón físico del juego.</strong>
+                <small>Los LED celestes, violetas y blancos indican que la ESP está esperando.</small>
+              </>
+            )}
+
+            {calibrationStatus === 'completed' && (
+              <>
+                <p>Los contadores de ambos NEMA quedaron definidos en la posición 0.</p>
+                <strong>Punto inicial guardado correctamente.</strong>
+                <small>
+                  Motor 1: {calibrationDetails?.motor_1_position ?? 0} · Motor 2:{' '}
+                  {calibrationDetails?.motor_2_position ?? 0}
+                </small>
+              </>
+            )}
+
+            {calibrationStatus === 'cancelled' && (
+              <p>La calibración fue cancelada. No se modificó el punto cero.</p>
+            )}
+
+            {calibrationStatus === 'timeout' && (
+              <p>Se agotó el tiempo sin recibir la confirmación del botón físico.</p>
+            )}
+
+            {calibrationStatus === 'rejected_busy' && (
+              <p>La ESP rechazó la calibración porque la máquina no estaba detenida.</p>
+            )}
+
+            {calibrationStatus === 'error' && (
+              <p>{calibrationError || 'Ocurrió un error durante la calibración.'}</p>
+            )}
+
+            {!['completed', 'cancelled', 'timeout', 'rejected_busy', 'error'].includes(calibrationStatus) ? (
+              <button type="button" onClick={handleCancelHomeCalibration} disabled={calibrationBusy}>
+                {calibrationBusy ? 'Cancelando...' : 'Cancelar'}
+              </button>
+            ) : (
+              <button type="button" onClick={handleCloseHomeCalibration}>
+                Cerrar
+              </button>
+            )}
           </div>
         </div>
       )}
