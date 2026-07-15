@@ -25,18 +25,6 @@
       ".read": "auth != null",
       ".write": "auth != null"
     },
-    "admin/component_status": {
-      ".read": "auth != null",
-      ".write": "auth != null"
-    },
-    "admin/components": {
-      ".read": "auth != null",
-      ".write": "auth != null"
-    },
-    "admin/game_control": {
-      ".read": "auth != null",
-      ".write": "auth != null"
-    },
     "notifications": {
       ".read": "auth != null",
       ".write": "auth != null"
