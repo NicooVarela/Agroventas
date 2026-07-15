@@ -40,6 +40,8 @@ La app usa Realtime Database como fuente unica de datos, siguiendo la documentac
 - `notifications/{notif_id}`
 - `admin`
 
+La web intenta autenticarse con Firebase Anonymous Auth, igual que la ESP32. Si Anonymous Auth no esta habilitado, continua usando las reglas publicas existentes; para produccion se recomienda habilitarlo y restringir las reglas.
+
 El celular normalizado es el identificador unico del usuario.
 Los prefijos telefonicos se editan en `src/phonePrefixes.js`. La normalizacion elimina el cero inicial local para todos los paises configurados.
 

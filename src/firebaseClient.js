@@ -1,4 +1,5 @@
 import { initializeApp } from 'firebase/app'
+import { getAuth, signInAnonymously } from 'firebase/auth'
 import {
   get,
   getDatabase,
@@ -34,6 +35,18 @@ export const isFirebaseConfigured = Boolean(
 
 const app = isFirebaseConfigured ? initializeApp(firebaseConfig) : null
 const realtimeDb = app ? getDatabase(app) : null
+const firebaseAuth = app ? getAuth(app) : null
+
+// The ESP32 uses anonymous Firebase auth. Keep the web client compatible with
+// those rules, while preserving public-rule deployments as a fallback.
+const firebaseAuthReady = firebaseAuth
+  ? (firebaseAuth.currentUser
+      ? Promise.resolve(firebaseAuth.currentUser)
+      : signInAnonymously(firebaseAuth).catch((error) => {
+          console.warn('Anonymous Firebase auth unavailable; continuing with database rules.', error)
+          return null
+        }))
+  : Promise.resolve(null)
 
 const USERS_KEY = 'agroventas.users'
 const RESULTS_KEY = 'agroventas.game_results'
@@ -796,6 +809,7 @@ async function ensureActiveSession() {
 
 async function getAdminConfig() {
   if (isFirebaseConfigured) {
+    await firebaseAuthReady
     try {
       const adminRef = ref(realtimeDb, 'admin')
       const snapshot = await get(adminRef)
@@ -817,6 +831,7 @@ async function getAdminConfig() {
 async function safeAdminUpdate(payload) {
   if (isFirebaseConfigured) {
     try {
+      await firebaseAuthReady
       await update(ref(realtimeDb, 'admin'), payload)
     } catch (error) {
       console.warn('Could not update admin node.', error)
