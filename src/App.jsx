@@ -1496,11 +1496,8 @@ function App() {
           role="dialog"
           aria-modal="true"
           aria-labelledby="staff-panel-title"
-          onPointerDown={(event) => {
-            if (event.target === event.currentTarget) setAdminOpen(false)
-          }}
         >
-          <section className="admin-panel" onPointerDown={(event) => event.stopPropagation()}>
+          <section className="admin-panel">
             <div className="admin-header">
               <Settings size={28} />
               <div>
