@@ -1455,91 +1455,108 @@ function App() {
       )}
 
       {adminOpen && (
-        <div className="admin-panel">
-          <div className="admin-header">
-            <Settings size={24} />
-            <strong>Panel staff</strong>
-            <button type="button" onClick={() => setAdminOpen(false)}>
-              Cerrar
-            </button>
-          </div>
-          <div className="admin-section">
-            <strong>Juego</strong>
-            <button
-              type="button"
-              className={staffGameEnabled ? 'danger-button' : ''}
-              onClick={handleToggleGameEnabled}
-              disabled={isBusy}
-            >
-              {staffGameEnabled ? 'Deshabilitar juego' : 'Habilitar juego'}
-            </button>
-          </div>
-          <div className="admin-section">
-            <strong>Mantenimiento</strong>
-            <button
-              type="button"
-              onClick={handleStartHomeCalibration}
-              disabled={isBusy || calibrationBusy || screen !== 'idle'}
-            >
-              Configurar punto cero de los NEMA
-            </button>
-            <small>
-              Colocá la plataforma en la base y confirmá con el botón físico.
-            </small>
-          </div>
-          <div className="admin-section">
-            <strong>Feria activa</strong>
-            <select
-              value={staffActiveSessionId}
-              onChange={(event) => handleActiveSessionChange(event.target.value)}
-              disabled={isBusy || staffSessions.length === 0}
-            >
-              {staffSessions.map((session) => (
-                <option key={session.id} value={session.id}>
-                  {session.nombre ?? session.id}
-                </option>
-              ))}
-            </select>
-            <form className="admin-inline-form" onSubmit={handleCreateSession}>
-              <input
-                type="text"
-                placeholder="Nueva feria"
-                value={newSessionName}
-                onChange={(event) => setNewSessionName(event.target.value)}
-              />
-              <button type="submit" disabled={isBusy || newSessionName.trim().length < 2}>
-                Crear
+        <div
+          className="admin-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="staff-panel-title"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) setAdminOpen(false)
+          }}
+        >
+          <section className="admin-panel" onPointerDown={(event) => event.stopPropagation()}>
+            <div className="admin-header">
+              <Settings size={28} />
+              <div>
+                <p className="eyebrow">Control interno</p>
+                <strong id="staff-panel-title">Panel Staff</strong>
+              </div>
+              <button type="button" onClick={() => setAdminOpen(false)}>
+                Cerrar
               </button>
-            </form>
-          </div>
-          <button type="button" onClick={handleSimulateVictory} disabled={screen !== 'playing'}>
-            Marcar victoria
-          </button>
-          <button type="button" onClick={handleSimulatePhysicalStart} disabled={isBusy}>
-            Simular botón físico
-          </button>
-          <button type="button" onClick={() => (window.location.hash = '#/ranking')}>
-            Ver ranking
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setAdminOpen(false)
-              window.location.hash = '#/cms'
-            }}
-          >
-            CMS textos
-          </button>
-          <button type="button" onClick={exportCsv}>
-            <Download size={18} />
-            Exportar CSV
-          </button>
-          {!isFirebaseConfigured && (
-            <button type="button" className="danger-button" onClick={resetLocalData}>
-              Borrar datos locales
-            </button>
-          )}
-          <small>{dataMessage || 'Tocá 5 veces rápido en cualquier lugar para abrir este panel.'}</small>
+            </div>
+            <div className="admin-grid">
+              <div className="admin-section">
+                <strong>Juego</strong>
+                <button
+                  type="button"
+                  className={staffGameEnabled ? 'danger-button' : ''}
+                  onClick={handleToggleGameEnabled}
+                  disabled={isBusy}
+                >
+                  {staffGameEnabled ? 'Deshabilitar juego' : 'Habilitar juego'}
+                </button>
+              </div>
+              <div className="admin-section">
+                <strong>Mantenimiento</strong>
+                <button
+                  type="button"
+                  onClick={handleStartHomeCalibration}
+                  disabled={isBusy || calibrationBusy || screen !== 'idle'}
+                >
+                  Configurar punto cero de los NEMA
+                </button>
+                <small>Colocá la plataforma en la base y confirmá con el botón físico.</small>
+              </div>
+              <div className="admin-section admin-section-wide">
+                <strong>Feria activa</strong>
+                <select
+                  value={staffActiveSessionId}
+                  onChange={(event) => handleActiveSessionChange(event.target.value)}
+                  disabled={isBusy || staffSessions.length === 0}
+                >
+                  {staffSessions.map((session) => (
+                    <option key={session.id} value={session.id}>
+                      {session.nombre ?? session.id}
+                    </option>
+                  ))}
+                </select>
+                <form className="admin-inline-form" onSubmit={handleCreateSession}>
+                  <input
+                    type="text"
+                    placeholder="Nueva feria"
+                    value={newSessionName}
+                    onChange={(event) => setNewSessionName(event.target.value)}
+                  />
+                  <button type="submit" disabled={isBusy || newSessionName.trim().length < 2}>
+                    Crear
+                  </button>
+                </form>
+              </div>
+              <div className="admin-actions admin-section-wide">
+                <button type="button" onClick={handleSimulateVictory} disabled={screen !== 'playing'}>
+                  Marcar victoria
+                </button>
+                <button type="button" onClick={handleSimulatePhysicalStart} disabled={isBusy}>
+                  Simular botón físico
+                </button>
+                <button type="button" onClick={() => (window.location.hash = '#/ranking')}>
+                  Ver ranking
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAdminOpen(false)
+                    window.location.hash = '#/cms'
+                  }}
+                >
+                  CMS textos
+                </button>
+                <button type="button" onClick={exportCsv}>
+                  <Download size={18} />
+                  Exportar CSV
+                </button>
+                {!isFirebaseConfigured && (
+                  <button type="button" className="danger-button" onClick={resetLocalData}>
+                    Borrar datos locales
+                  </button>
+                )}
+              </div>
+            </div>
+            <small className="admin-footer">
+              {dataMessage || 'Tocá 5 veces rápido en cualquier lugar para abrir este panel.'}
+            </small>
+          </section>
         </div>
       )}
 
