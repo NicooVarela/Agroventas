@@ -1442,6 +1442,24 @@ button:disabled {
   font-weight: 900;
 }
 
+.admin-close-button {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  margin-left: auto;
+  place-items: center;
+  border-radius: 14px !important;
+  color: var(--green-950);
+  background: var(--mint) !important;
+  cursor: pointer;
+}
+
+.admin-close-button:hover,
+.admin-close-button:focus-visible {
+  color: #fff;
+  background: var(--green-900) !important;
+}
+
 .admin-section {
   display: grid;
   gap: 8px;
@@ -1473,7 +1491,7 @@ button:disabled {
 
 .admin-actions {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -1498,10 +1516,24 @@ button:disabled {
   gap: 8px;
 }
 
+.admin-session-select-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
 .admin-session-actions {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(2, auto);
   gap: 10px;
+}
+
+.admin-session-actions button {
+  min-height: 42px;
+  padding: 0 16px;
+  white-space: nowrap;
+  font-size: 14px;
 }
 
 .admin-panel .danger-button,

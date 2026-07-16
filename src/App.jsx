@@ -7,6 +7,7 @@ import {
   Settings,
   Smartphone,
   TimerOff,
+  X,
   UserRound,
 } from 'lucide-react'
 import './App.css'
@@ -1506,8 +1507,14 @@ function App() {
                 <p className="eyebrow">Control interno</p>
                 <strong id="staff-panel-title">Panel Staff</strong>
               </div>
-              <button type="button" onClick={() => setAdminOpen(false)}>
-                Cerrar
+              <button
+                className="admin-close-button"
+                type="button"
+                onClick={() => setAdminOpen(false)}
+                aria-label="Cerrar panel Staff"
+                title="Cerrar panel Staff"
+              >
+                <X size={30} strokeWidth={3} />
               </button>
             </div>
             <div className="admin-grid">
@@ -1535,17 +1542,32 @@ function App() {
               </div>
               <div className="admin-section admin-section-wide">
                 <strong>Feria activa</strong>
-                <select
-                  value={staffActiveSessionId}
-                  onChange={(event) => handleActiveSessionChange(event.target.value)}
-                  disabled={isBusy || staffSessions.length === 0}
-                >
-                  {staffSessions.map((session) => (
-                    <option key={session.id} value={session.id}>
-                      {session.nombre ?? session.id}
-                    </option>
-                  ))}
-                </select>
+                <div className="admin-session-select-row">
+                  <select
+                    value={staffActiveSessionId}
+                    onChange={(event) => handleActiveSessionChange(event.target.value)}
+                    disabled={isBusy || staffSessions.length === 0}
+                  >
+                    {staffSessions.map((session) => (
+                      <option key={session.id} value={session.id}>
+                        {session.nombre ?? session.id}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="admin-session-actions">
+                    <button type="button" onClick={handleResetSessionRanking} disabled={isBusy || !staffActiveSessionId}>
+                      Resetear ranking
+                    </button>
+                    <button
+                      type="button"
+                      className="danger-button"
+                      onClick={handleDeleteSession}
+                      disabled={isBusy || staffSessions.length <= 1 || !staffActiveSessionId}
+                    >
+                      Eliminar feria
+                    </button>
+                  </div>
+                </div>
                 <form className="admin-inline-form" onSubmit={handleCreateSession}>
                   <input
                     type="text"
@@ -1557,19 +1579,6 @@ function App() {
                     Crear
                   </button>
                 </form>
-                <div className="admin-session-actions">
-                  <button type="button" onClick={handleResetSessionRanking} disabled={isBusy || !staffActiveSessionId}>
-                    Resetear ranking de esta feria
-                  </button>
-                  <button
-                    type="button"
-                    className="danger-button"
-                    onClick={handleDeleteSession}
-                    disabled={isBusy || staffSessions.length <= 1 || !staffActiveSessionId}
-                  >
-                    Eliminar feria seleccionada
-                  </button>
-                </div>
               </div>
               <div className="admin-actions admin-section-wide">
                 <button type="button" onClick={handleSimulateVictory} disabled={screen !== 'playing'}>
