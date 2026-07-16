@@ -1463,6 +1463,7 @@ button:disabled {
 .admin-section {
   display: grid;
   gap: 8px;
+  align-self: start;
   padding: 10px;
   border-radius: 14px;
   background: rgba(15, 164, 97, 0.08);
