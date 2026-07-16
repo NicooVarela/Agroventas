@@ -12,7 +12,6 @@ import {
 import './App.css'
 import { PHONE_PREFIX_OPTIONS } from './phonePrefixes'
 import {
-  clearLocalData,
   createGameSession,
   findParticipantByPhone,
   finishGameSession,
@@ -38,6 +37,8 @@ import {
   setMotorsEnabled,
   startGameHeartbeat,
   createFairSession,
+  deleteFairSession,
+  resetSessionRanking,
   setActiveSession,
   setGameEnabled,
   upsertParticipantResult,
@@ -1009,6 +1010,8 @@ function App() {
     }
   }
 
+  // Kept for the maintenance flow; the control stays hidden from the kiosk panel for now.
+  // eslint-disable-next-line no-unused-vars
   async function handleStartHomeCalibration() {
     setCalibrationModalOpen(true)
     setCalibrationRequestId(null)
@@ -1126,12 +1129,6 @@ function App() {
     }
   }
 
-  async function resetLocalData() {
-    await clearLocalData()
-    await loadRanking()
-    setDataMessage('Datos locales borrados.')
-  }
-
   async function handleToggleGameEnabled() {
     const nextEnabled = !staffGameEnabled
     setIsBusy(true)
@@ -1172,6 +1169,46 @@ function App() {
       setDataMessage(`Feria creada: ${nextSession.nombre}.`)
     } catch (error) {
       setDataMessage(error.userMessage ?? formatError('FB-011', 'No se pudo crear la feria.', error))
+    } finally {
+      setIsBusy(false)
+    }
+  }
+
+  async function handleResetSessionRanking() {
+    if (!staffActiveSessionId || !window.confirm('¿Resetear el ranking de esta feria?')) return
+
+    setIsBusy(true)
+    try {
+      const removedCount = await resetSessionRanking(staffActiveSessionId)
+      await loadRanking()
+      setDataMessage(`Ranking reiniciado. Registros eliminados: ${removedCount}.`)
+    } catch (error) {
+      setDataMessage(formatError('FB-012', 'No se pudo resetear el ranking.', error))
+    } finally {
+      setIsBusy(false)
+    }
+  }
+
+  async function handleDeleteSession() {
+    if (!staffActiveSessionId || staffSessions.length <= 1) {
+      setDataMessage('No se puede eliminar la única feria disponible.')
+      return
+    }
+
+    const selectedSession = staffSessions.find((session) => session.id === staffActiveSessionId)
+    const sessionName = selectedSession?.nombre ?? staffActiveSessionId
+    if (!window.confirm(`¿Eliminar la feria "${sessionName}" y su ranking?`)) return
+
+    setIsBusy(true)
+    try {
+      const nextSession = staffSessions.find((session) => session.id !== staffActiveSessionId)
+      await deleteFairSession(staffActiveSessionId)
+      await setActiveSession(nextSession.id)
+      await loadStaffSettings()
+      await loadRanking()
+      setDataMessage(`Feria eliminada: ${sessionName}.`)
+    } catch (error) {
+      setDataMessage(formatError('FB-013', 'No se pudo eliminar la feria.', error))
     } finally {
       setIsBusy(false)
     }
@@ -1487,17 +1524,6 @@ function App() {
                   {staffGameEnabled ? 'Deshabilitar juego' : 'Habilitar juego'}
                 </button>
               </div>
-              <div className="admin-section">
-                <strong>Mantenimiento</strong>
-                <button
-                  type="button"
-                  onClick={handleStartHomeCalibration}
-                  disabled={isBusy || calibrationBusy || screen !== 'idle'}
-                >
-                  Configurar punto cero de los NEMA
-                </button>
-                <small>Colocá la plataforma en la base y confirmá con el botón físico.</small>
-              </div>
               <div className="admin-section admin-section-wide">
                 <strong>Feria activa</strong>
                 <select
@@ -1522,6 +1548,19 @@ function App() {
                     Crear
                   </button>
                 </form>
+                <div className="admin-session-actions">
+                  <button type="button" onClick={handleResetSessionRanking} disabled={isBusy || !staffActiveSessionId}>
+                    Resetear ranking de esta feria
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-button"
+                    onClick={handleDeleteSession}
+                    disabled={isBusy || staffSessions.length <= 1 || !staffActiveSessionId}
+                  >
+                    Eliminar feria seleccionada
+                  </button>
+                </div>
               </div>
               <div className="admin-actions admin-section-wide">
                 <button type="button" onClick={handleSimulateVictory} disabled={screen !== 'playing'}>
@@ -1533,24 +1572,10 @@ function App() {
                 <button type="button" onClick={() => (window.location.hash = '#/ranking')}>
                   Ver ranking
                 </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAdminOpen(false)
-                    window.location.hash = '#/cms'
-                  }}
-                >
-                  CMS textos
-                </button>
                 <button type="button" onClick={exportCsv}>
                   <Download size={18} />
                   Exportar CSV
                 </button>
-                {!isFirebaseConfigured && (
-                  <button type="button" className="danger-button" onClick={resetLocalData}>
-                    Borrar datos locales
-                  </button>
-                )}
               </div>
             </div>
             <small className="admin-footer">

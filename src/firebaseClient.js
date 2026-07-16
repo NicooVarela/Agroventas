@@ -1171,6 +1171,56 @@ export async function createFairSession(name) {
   return { id: sessionId, ...payload }
 }
 
+export async function resetSessionRanking(sessionId) {
+  if (!sessionId) return 0
+
+  if (isFirebaseConfigured) {
+    const snapshot = await get(ref(realtimeDb, 'game_results'))
+    const updates = {}
+    snapshot.forEach((childSnapshot) => {
+      if (childSnapshot.val()?.session_id === sessionId) {
+        updates[`game_results/${childSnapshot.key}`] = null
+      }
+    })
+
+    if (Object.keys(updates).length > 0) await update(ref(realtimeDb), updates)
+    return Object.keys(updates).length
+  }
+
+  const results = readLocal(RESULTS_KEY, {})
+  const remainingResults = Object.fromEntries(
+    Object.entries(results).filter(([, result]) => result?.session_id !== sessionId),
+  )
+  const removedCount = Object.keys(results).length - Object.keys(remainingResults).length
+  writeLocal(RESULTS_KEY, remainingResults)
+  return removedCount
+}
+
+export async function deleteFairSession(sessionId) {
+  if (!sessionId) return
+
+  if (isFirebaseConfigured) {
+    const snapshot = await get(ref(realtimeDb, 'game_results'))
+    const updates = { [`sessions/${sessionId}`]: null }
+    snapshot.forEach((childSnapshot) => {
+      if (childSnapshot.val()?.session_id === sessionId) {
+        updates[`game_results/${childSnapshot.key}`] = null
+      }
+    })
+    await update(ref(realtimeDb), updates)
+    return
+  }
+
+  const sessions = readLocal(SESSIONS_KEY, {})
+  delete sessions[sessionId]
+  writeLocal(SESSIONS_KEY, sessions)
+  const results = readLocal(RESULTS_KEY, {})
+  writeLocal(
+    RESULTS_KEY,
+    Object.fromEntries(Object.entries(results).filter(([, result]) => result?.session_id !== sessionId)),
+  )
+}
+
 function toDbUser(participant) {
   const celular = normalizePhone(participant.phone ?? participant.celular ?? '')
   return {

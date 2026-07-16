@@ -1498,6 +1498,12 @@ button:disabled {
   gap: 8px;
 }
 
+.admin-session-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .admin-panel .danger-button,
 .admin-section .danger-button {
   background: var(--red);
@@ -2386,7 +2392,8 @@ button:disabled {
 
 @media (max-width: 760px) {
   .admin-grid,
-  .admin-actions {
+  .admin-actions,
+  .admin-session-actions {
     grid-template-columns: 1fr;
   }
 
