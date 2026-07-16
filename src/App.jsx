@@ -1010,8 +1010,6 @@ function App() {
     }
   }
 
-  // Kept for the maintenance flow; the control stays hidden from the kiosk panel for now.
-  // eslint-disable-next-line no-unused-vars
   async function handleStartHomeCalibration() {
     setCalibrationModalOpen(true)
     setCalibrationRequestId(null)
@@ -1523,6 +1521,17 @@ function App() {
                 >
                   {staffGameEnabled ? 'Deshabilitar juego' : 'Habilitar juego'}
                 </button>
+              </div>
+              <div className="admin-section">
+                <strong>Mantenimiento</strong>
+                <button
+                  type="button"
+                  onClick={handleStartHomeCalibration}
+                  disabled={isBusy || calibrationBusy || screen !== 'idle'}
+                >
+                  Configurar punto cero de los NEMA
+                </button>
+                <small>Colocá la plataforma en la base y confirmá con el botón físico.</small>
               </div>
               <div className="admin-section admin-section-wide">
                 <strong>Feria activa</strong>
