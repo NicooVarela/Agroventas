@@ -1516,7 +1516,6 @@ function App() {
             </div>
             <div className="admin-grid">
               <div className="admin-section">
-                <strong>Juego</strong>
                 <button
                   type="button"
                   className={staffGameEnabled ? 'danger-button' : ''}
